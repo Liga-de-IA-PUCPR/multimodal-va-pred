@@ -1,0 +1,17 @@
+name: multimodal_va
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch
+  - scikit-learn
+  - matplotlib
+  - jupyterlab
+  - pip
+  - pip:
+      - uv
+      - tensorflow
+      - opencv-python
+      - transformers
+      - pydub
