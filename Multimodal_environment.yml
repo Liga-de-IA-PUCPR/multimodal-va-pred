@@ -1,4 +1,4 @@
-name: multimodal_va
+name: multimodal_va_liga
 channels:
   - pytorch
   - conda-forge
@@ -8,6 +8,8 @@ dependencies:
   - scikit-learn
   - matplotlib
   - jupyterlab
+  - cudatoolkit=11.8.0 
+  - cudnn
   - pip
   - pip:
       - uv
