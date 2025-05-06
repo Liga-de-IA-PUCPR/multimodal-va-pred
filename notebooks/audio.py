@@ -1,59 +1,51 @@
-import os
-import torch
 import torchaudio
-from torchvision import models
-from torch import nn
-from moviepy.editor import VideoFileClip
+import torch
 from torchaudio.transforms import MelSpectrogram
+from backbones import AudioBackbone  # Assuming you already created this
 
-class AudioProcessor:
-    def __init__(self, sampling_rate=44100, n_mels=64, segment_duration=1.0):
-        self.sampling_rate = sampling_rate
-        self.n_mels = n_mels
-        self.segment_duration = segment_duration
-        self.mel_transform = MelSpectrogram(sample_rate=sampling_rate, n_mels=n_mels)
+# Initialize audio backbone
+audio_backbone = AudioBackbone(out_dim=256).to("cuda" if torch.cuda.is_available() else "cpu")
+audio_backbone.eval()
 
-    def extract_audio(self, video_path, output_audio_path):
-        """Extract audio from video using moviepy"""
-        video = VideoFileClip(video_path)
-        video.audio.write_audiofile(output_audio_path, fps=self.sampling_rate)
+# Initialize MelSpectrogram transform
+mel_transform = MelSpectrogram(
+    sample_rate=16000,  # Match the sample rate of your audio backbone
+    n_fft=400,          # Number of FFT bins
+    hop_length=160,     # Hop length between frames
+    n_mels=128          # Number of mel filter banks
+)
 
-    def segment_audio(self, audio_path):
-        """Segment audio into chunks of fixed duration"""
-        waveform, sample_rate = torchaudio.load(audio_path)
-        segment_length = int(self.segment_duration * sample_rate)
-        segments = waveform.unfold(1, segment_length, segment_length)
-        return segments
+def extract_audio_features_with_mel(video_path, num_frames, fps=25):
+    """
+    Extracts and aligns audio features using a MelSpectrogram representation.
+    Args:
+        video_path: Path to the video file
+        num_frames: Total number of video frames
+        fps: Frames per second of the video
+    Returns:
+        Aligned audio features [num_frames, 256]
+    """
+    waveform, sample_rate = torchaudio.load(video_path)
+    resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+    waveform = resampler(waveform)  # Resample to 16kHz
 
-    def extract_features(self, audio_segments):
-        """Convert audio segments to spectrogram features"""
-        features = [self.mel_transform(segment) for segment in audio_segments]
-        return torch.stack(features)
+    # Apply mel spectrogram transformation
+    mel_spectrogram = mel_transform(waveform)  # Shape: [1, n_mels, time_steps]
 
-class AudioModel(nn.Module):
-    def __init__(self, pretrained=True):
-        super(AudioModel, self).__init__()
-        self.base_model = models.resnet18(pretrained=pretrained)
-        self.base_model.fc = nn.Linear(self.base_model.fc.in_features, 128)  # Reduce to embedding size
+    # Average mel spectrogram across time to create a feature vector
+    mel_features = mel_spectrogram.mean(dim=2).squeeze(0)  # Shape: [n_mels]
 
-    def forward(self, x):
-        return self.base_model(x)
+    # Ensure the mel features align with the number of frames
+    mel_features = mel_features.unsqueeze(0).repeat(num_frames, 1)  # Repeat for each frame
 
-def process_audio(video_path, audio_output_dir, model):
-    # Step 1: Initialize processor and model
-    audio_processor = AudioProcessor()
-    os.makedirs(audio_output_dir, exist_ok=True)
+    # Pass through audio backbone
+    with torch.no_grad():
+        audio_features = audio_backbone(mel_features)  # Shape: [num_frames, 256]
 
-    # Step 2: Extract audio from video
-    audio_path = os.path.join(audio_output_dir, "audio.wav")
-    audio_processor.extract_audio(video_path, audio_path)
-
-    # Step 3: Segment audio
-    segments = audio_processor.segment_audio(audio_path)
-
-    # Step 4: Extract features from segments
-    features = audio_processor.extract_features(segments)
-
-    # Step 5: Run features through audio model
-    audio_features = model(features)
     return audio_features
+
+# Example usage
+video_path = "data/raw/new_vids/461.mp4"
+num_frames = 100  # Example number of frames
+aligned_audio_features = extract_audio_features_with_mel(video_path, num_frames)
+print(aligned_audio_features.shape)  # [num_frames, 256]
