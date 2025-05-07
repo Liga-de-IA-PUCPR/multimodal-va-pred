@@ -1,4 +1,7 @@
 from torch.utils.data import Dataset
+from utils.audio import extract_audio_features_with_mel
+from utils.video import extract_visual_features
+from utils.graph_construction import build_video_graph
 import os
 
 
@@ -17,14 +20,8 @@ class Affwild2GraphDataset(Dataset):
 
         # Extract features
         visual_features = extract_visual_features(video_folder)
-        audio_features = extract_audio_features(video_path)
+        audio_features = extract_audio_features_with_mel(video_path)
 
         # Build graph
         graph_data = build_video_graph(visual_features, audio_features)
         return graph_data
-
-# Example usage
-video_ids = [461, 462, 463]  # List of video IDs
-dataset = Affwild2GraphDataset(video_ids, root_dir="data/raw")
-graph = dataset[0]
-print(graph)

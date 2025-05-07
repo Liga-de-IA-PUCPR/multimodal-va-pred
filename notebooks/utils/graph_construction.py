@@ -35,6 +35,3 @@ def build_video_graph(visual_features, audio_features):
     data = Data(x=node_features, edge_index=edge_index)
     return data
 
-# Example usage
-graph_data = build_video_graph(visual_features, audio_features)
-print(graph_data)

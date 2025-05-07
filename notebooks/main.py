@@ -1,7 +1,7 @@
 import argparse
 import os
 from torch.utils.data import DataLoader
-from notebooks.dataset import Affwild2GraphDataset
+from utils.dataset import Affwild2GraphDataset
 
 def main():
     parser = argparse.ArgumentParser(description="Run graph-based VA prediction")

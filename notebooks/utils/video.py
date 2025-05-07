@@ -2,7 +2,7 @@ import os
 import torch
 from torchvision import transforms
 from PIL import Image
-from backbones import VisualBackbone  # Assuming you already created this
+from utils.backbones import VisualBackbone  # Assuming you already created this
 
 # Initialize visual backbone
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -26,8 +26,3 @@ def extract_visual_features(video_folder):
             feature = visual_backbone(img)  # Extract feature
         features.append(feature.cpu())
     return torch.stack(features)  # Shape: [num_frames, 256]
-
-# Example usage
-video_folder = "data/raw/cropped_aligned_new_50_vids/461"
-visual_features = extract_visual_features(video_folder)
-print(visual_features.shape)  # [num_frames, 256]
