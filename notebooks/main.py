@@ -7,20 +7,36 @@ import utils.config as config
 from utils.dataset import Affwild2GraphDataset
 # For PyTorch Geometric, DataLoader is imported from torch_geometric.loader
 from torch_geometric.loader import DataLoader as PyGDataLoader 
+from models.GTAT.train_emotion_model import EmotionTrainer
+from models.GTAT.predict_emotion import EmotionPredictor
 
 def main():
-    parser = argparse.ArgumentParser(description="Process video data into graph structures.")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
+    parser = argparse.ArgumentParser(description="Process video data into graph structures, train or predict emotions.")
+    
+    # Grupo mutuamente exclusivo para operações principais
+    operation_group = parser.add_mutually_exclusive_group(required=True)
+    operation_group.add_argument(
         "--video_ids",
         type=str,
         help="Comma-separated list of video IDs, e.g. '461,462,463'"
     )
-    group.add_argument(
+    operation_group.add_argument(
         "--all",
         action="store_true",
         help=f"Use all videos found as subdirectories in root_dir/{config.VISUAL_FRAMES_SUBDIR_NAME}/"
     )
+    operation_group.add_argument(
+        "--train",
+        action="store_true",
+        help="Train the emotion prediction model"
+    )
+    operation_group.add_argument(
+        "--predict",
+        action="store_true",
+        help="Run prediction using a trained model"
+    )
+    
+    # Argumentos comuns
     parser.add_argument(
         "--root_dir",
         type=str,
@@ -35,8 +51,130 @@ def main():
         default=1, 
         help="Batch size for PyG DataLoader. Note: PyG DataLoader handles batching of Data objects."
     )
+    
+    # Argumentos para treinamento
+    training_group = parser.add_argument_group('Training parameters')
+    training_group.add_argument(
+        "--train_video_ids_csv",
+        type=str,
+        help="Path to CSV file containing video IDs for training"
+    )
+    training_group.add_argument(
+        "--val_video_ids_csv",
+        type=str,
+        help="Path to CSV file containing video IDs for validation"
+    )
+    training_group.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+        help="Number of training epochs"
+    )
+    training_group.add_argument(
+        "--lr",
+        type=float,
+        default=0.001,
+        help="Learning rate"
+    )
+    training_group.add_argument(
+        "--dropout",
+        type=float,
+        default=0.2,
+        help="Dropout rate"
+    )
+    training_group.add_argument(
+        "--output_dir",
+        type=str,
+        default="outputs",
+        help="Directory to save model outputs"
+    )
+    
+    # Argumentos para predição
+    prediction_group = parser.add_argument_group('Prediction parameters')
+    prediction_group.add_argument(
+        "--model_path",
+        type=str,
+        help="Path to trained model (.pth file)"
+    )
+    prediction_group.add_argument(
+        "--test_video_ids",
+        type=str,
+        help="Path to CSV file containing video IDs for testing (optionally with ground truth)"
+    )
+    
+    # Argumentos comuns para arquitetura do modelo
+    model_group = parser.add_argument_group('Model architecture')
+    model_group.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=128,
+        help="Hidden dimension for model layers"
+    )
+    model_group.add_argument(
+        "--topology_dim",
+        type=int,
+        default=15,
+        help="Dimension for topological features"
+    )
+    model_group.add_argument(
+        "--num_gtat_layers",
+        type=int,
+        default=2,
+        help="Number of GTAT layers"
+    )
+    model_group.add_argument(
+        "--gtat_heads",
+        type=int,
+        default=4,
+        help="Number of attention heads in GTAT layers"
+    )
+    
     args = parser.parse_args()
 
+    # Lógica para treinamento
+    if args.train:
+        if not args.train_video_ids_csv or not args.val_video_ids_csv:
+            print("Error: --train_video_ids_csv and --val_video_ids_csv are required for training")
+            return
+        
+        trainer = EmotionTrainer(
+            root_dir=args.root_dir,
+            train_video_ids_csv=args.train_video_ids_csv,
+            val_video_ids_csv=args.val_video_ids_csv,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            hidden_dim=args.hidden_dim,
+            topology_dim=args.topology_dim,
+            num_gtat_layers=args.num_gtat_layers,
+            gtat_heads=args.gtat_heads,
+            dropout=args.dropout,
+            output_dir=args.output_dir
+        )
+        trainer.run()
+        return
+    
+    # Lógica para predição
+    if args.predict:
+        if not args.model_path or not args.test_video_ids:
+            print("Error: --model_path and --test_video_ids are required for prediction")
+            return
+        
+        predictor = EmotionPredictor(
+            model_path=args.model_path,
+            test_video_ids=args.test_video_ids,
+            root_dir=args.root_dir,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            hidden_dim=args.hidden_dim,
+            topology_dim=args.topology_dim,
+            num_gtat_layers=args.num_gtat_layers,
+            gtat_heads=args.gtat_heads
+        )
+        predictor.run()
+        return
+    
+    # Código original para processamento de vídeos
     video_ids_list = []
     if args.all:
         visual_data_parent_dir = os.path.join(args.root_dir, config.VISUAL_FRAMES_SUBDIR_NAME)

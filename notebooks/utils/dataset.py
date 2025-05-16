@@ -15,9 +15,19 @@ from utils.config import (
 )
 
 class Affwild2GraphDataset(Dataset):
-    def __init__(self, video_ids, root_dir: str):
+    def __init__(self, video_ids, root_dir: str, annotations_df=None):
+        """
+        Dataset para grafos de vídeo do Aff-Wild2 para reconhecimento de emoções.
+        
+        Args:
+            video_ids: Lista de IDs de vídeo a serem processados
+            root_dir: Diretório raiz contendo subdiretórios de dados
+            annotations_df: (Opcional) DataFrame pandas contendo anotações de valência e excitação
+                            O DataFrame deve ter colunas 'video_id', 'valence' e 'arousal'
+        """
         self.video_ids = video_ids
         self.root_dir = root_dir
+        self.annotations_df = annotations_df
 
     def __len__(self):
         return len(self.video_ids)
@@ -75,5 +85,17 @@ class Affwild2GraphDataset(Dataset):
         
         graph_data = build_video_graph(visual_features, audio_features)
         graph_data.video_id = video_id
+        
+        # Adicionar valores de valência e excitação se disponíveis
+        if self.annotations_df is not None:
+            # Encontrar a linha correspondente ao vídeo atual
+            video_annotations = self.annotations_df[self.annotations_df['video_id'] == video_id]
+            
+            if not video_annotations.empty:
+                valence = video_annotations['valence'].values[0]
+                arousal = video_annotations['arousal'].values[0]
+                
+                graph_data.valence = torch.tensor(valence, dtype=torch.float)
+                graph_data.arousal = torch.tensor(arousal, dtype=torch.float)
         
         return graph_data
