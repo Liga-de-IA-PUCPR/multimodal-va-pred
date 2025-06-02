@@ -174,6 +174,8 @@ def main():
         predictor.run()
         return
     
+    '''
+    
     # Código original para processamento de vídeos
     video_ids_list = []
     if args.all:
@@ -241,6 +243,7 @@ def main():
          print("\nNo batches were processed. Check dataset initialization and data paths.")
     else:
         print(f"\nFinished processing {processed_batches} batches.")
-
+    '''
+    
 if __name__ == "__main__":
     main()

@@ -19,67 +19,59 @@ _transform = transforms.Compose([
 
 def extract_visual_features(video_frames_folder: str, num_frames_to_extract: int = NUM_FRAMES) -> torch.Tensor:
     """
-    Extract visual features from video frames stored in a folder.
+    Extract visual features from video frames stored in a folder, processing the entire video in batches.
     Args:
         video_frames_folder: Path to folder containing video frame images (e.g., .jpg, .png)
-        num_frames_to_extract: Number of frames to extract features for. Defaults to config.NUM_FRAMES.
+        num_frames_to_extract: Number of frames to extract per batch. Defaults to config.NUM_FRAMES.
     Returns:
-        torch.Tensor: Visual features of shape [num_frames_to_extract, VISUAL_BACKBONE_OUT_DIM].
+        torch.Tensor: Visual features of shape [total_frames, VISUAL_BACKBONE_OUT_DIM].
                       Features are returned on CPU.
     """
-    default_zero_features = torch.zeros(num_frames_to_extract, VISUAL_BACKBONE_OUT_DIM, device="cpu")
-    
     try:
         frame_files = sorted([f for f in os.listdir(video_frames_folder) if os.path.isfile(os.path.join(video_frames_folder, f))])
     except FileNotFoundError:
-        print(f"Error: Video frames folder not found: {video_frames_folder}. Returning zeros.")
-        return default_zero_features
+        print(f"Error: Video frames folder not found: {video_frames_folder}. Returning empty tensor.")
+        return torch.zeros(0, VISUAL_BACKBONE_OUT_DIM, device="cpu")
 
     if not frame_files:
-        print(f"Warning: No frame files found in {video_frames_folder}. Returning zeros.")
-        return default_zero_features
+        print(f"Warning: No frame files found in {video_frames_folder}. Returning empty tensor.")
+        return torch.zeros(0, VISUAL_BACKBONE_OUT_DIM, device="cpu")
 
-    total_frames_available = len(frame_files)
-    
-    indices = []
-    if total_frames_available > 0 :
-        if total_frames_available <= num_frames_to_extract:
-            base_indices = list(range(total_frames_available))
-            if total_frames_available < num_frames_to_extract:
-                padding_needed = num_frames_to_extract - total_frames_available
-                padding_indices = [total_frames_available - 1] * padding_needed # repeat last frame index
-                indices = base_indices + padding_indices
-            else: # total_frames_available == num_frames_to_extract
-                indices = base_indices
-        else: # total_frames_available > num_frames_to_extract
-            indices = torch.linspace(0, total_frames_available - 1, num_frames_to_extract).long().tolist()
-    
-    if not indices and num_frames_to_extract > 0:
-        print(f"Warning: Could not determine frame indices for {video_frames_folder} (available: {total_frames_available}, needed: {num_frames_to_extract}). Returning zeros.")
-        return default_zero_features
+    total_frames = len(frame_files)
+    all_features = []
 
-    extracted_features_list = []
-    for i, frame_idx in enumerate(indices):
-        frame_path = os.path.join(video_frames_folder, frame_files[frame_idx])
-        try:
-            img = Image.open(frame_path).convert("RGB")
-            img_tensor = _transform(img).unsqueeze(0).to(_DEVICE)
-            with torch.no_grad():
-                feature_vec = _visual_backbone(img_tensor) # [1, VISUAL_BACKBONE_OUT_DIM]
-            extracted_features_list.append(feature_vec.cpu()) 
-        except (FileNotFoundError, UnidentifiedImageError, Exception) as e:
-            print(f"Error loading or processing image {frame_path}: {e}. Using zeros for this frame.")
-            # Create a zero feature vector of the correct dimension on CPU
-            zero_feature_vec = torch.zeros(1, VISUAL_BACKBONE_OUT_DIM, device="cpu")
-            extracted_features_list.append(zero_feature_vec)
-            continue
-    
-    if not extracted_features_list : 
-        print(f"Warning: No features were extracted for {video_frames_folder}. Returning zeros.")
-        return default_zero_features
+    # Process frames in batches
+    for batch_start in range(0, total_frames, num_frames_to_extract):
+        batch_end = min(batch_start + num_frames_to_extract, total_frames)
+        batch_indices = list(range(batch_start, batch_end))
         
-    # Stack features: list of [1, VISUAL_BACKBONE_OUT_DIM] tensors becomes [num_frames_to_extract, 1, VISUAL_BACKBONE_OUT_DIM]
-    stacked_features = torch.cat(extracted_features_list, dim=0) # Using cat since each element is [1, dim]
-    
-    # final_features shape: [num_frames_to_extract, VISUAL_BACKBONE_OUT_DIM]
-    return stacked_features # Already on CPU
+        # If this is the last batch and we need padding
+        if len(batch_indices) < num_frames_to_extract:
+            padding_needed = num_frames_to_extract - len(batch_indices)
+            batch_indices.extend([batch_indices[-1]] * padding_needed)
+
+        batch_features = []
+        for frame_idx in batch_indices:
+            frame_path = os.path.join(video_frames_folder, frame_files[frame_idx])
+            try:
+                img = Image.open(frame_path).convert("RGB")
+                img_tensor = _transform(img).unsqueeze(0).to(_DEVICE)
+                with torch.no_grad():
+                    feature_vec = _visual_backbone(img_tensor)  # [1, VISUAL_BACKBONE_OUT_DIM]
+                batch_features.append(feature_vec.cpu())
+            except (FileNotFoundError, UnidentifiedImageError, Exception) as e:
+                print(f"Error loading or processing image {frame_path}: {e}. Using zeros for this frame.")
+                zero_feature_vec = torch.zeros(1, VISUAL_BACKBONE_OUT_DIM, device="cpu")
+                batch_features.append(zero_feature_vec)
+
+        if batch_features:
+            batch_tensor = torch.cat(batch_features, dim=0)  # [batch_size, VISUAL_BACKBONE_OUT_DIM]
+            all_features.append(batch_tensor)
+
+    if not all_features:
+        print(f"Warning: No features were extracted for {video_frames_folder}. Returning empty tensor.")
+        return torch.zeros(0, VISUAL_BACKBONE_OUT_DIM, device="cpu")
+
+    # Concatenate all batches
+    final_features = torch.cat(all_features, dim=0)  # [total_frames, VISUAL_BACKBONE_OUT_DIM]
+    return final_features  # Already on CPU

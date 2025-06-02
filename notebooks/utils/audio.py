@@ -30,7 +30,7 @@ class AudioFeatureExtractor:
             hop_length=hop_length,
             power=power,
             normalized=normalized,
-            f_max=f_max # Use configured f_max
+            f_max=f_max
         ).to(self._device)
         
     def _load_and_preprocess_audio(self, audio_path: str) -> torch.Tensor:
@@ -39,7 +39,7 @@ class AudioFeatureExtractor:
             waveform, sr = torchaudio.load(audio_path)
         except Exception as e:
             print(f"Error loading audio {audio_path}: {e}. Returning empty tensor.")
-            return torch.empty(0, device=self._device) # Return on target device
+            return torch.empty(0, device=self._device)
             
         waveform = waveform.to(self._device)
         
@@ -50,28 +50,6 @@ class AudioFeatureExtractor:
             resampler_module = Resample(sr, self.sample_rate)
             resampler_module = resampler_module.to(self._device)
             
-            # --- Debugging device placement ---
-            kernel_device_str = "N/A"
-            # The kernel is a buffer. We try to access it.
-            # In torchaudio.transforms.Resample, it uses _torchaudio.kaldi.ResampleWaveform
-            # or functional._apply_sinc_resample_kernel. The kernel is created and stored as buffer.
-            # Let's check the device of a buffer if one is named 'kernel' or similar.
-            resampler_buffers = dict(resampler_module.named_buffers())
-            if 'kernel' in resampler_buffers: # Common name for sinc kernel buffer
-                kernel_device_str = str(resampler_buffers['kernel'].device)
-            elif resampler_buffers: # Check device of the first available buffer as a proxy
-                first_buffer_name = next(iter(resampler_buffers))
-                kernel_device_str = f"first_buffer ('{first_buffer_name}'): {resampler_buffers[first_buffer_name].device}"
-            else:
-                kernel_device_str = "No buffers found in resampler_module"
-
-            print(f"Debug Resample for {audio_path}: "
-                  f"waveform.device={waveform.device}, "
-                  f"resampler_kernel_approx_device={kernel_device_str}, "
-                  f"target_device={self._device}, "
-                  f"original_sr={sr}, target_sr={self.sample_rate}")
-            # --- End Debugging ---
-            
             try:
                 waveform = resampler_module(waveform)
             except RuntimeError as e:
@@ -79,7 +57,7 @@ class AudioFeatureExtractor:
                 print(f"  Waveform was on: {waveform.device}, shape: {waveform.shape}")
                 print(f"  Resampler module buffers: {[(name, buf.device) for name, buf in resampler_module.named_buffers()]}")
                 print(f"  Resampler module parameters: {[(name, param.device) for name, param in resampler_module.named_parameters()]}")
-                raise e # Re-raise the error after printing debug info
+                raise e
             
         return waveform
     
@@ -96,25 +74,39 @@ class AudioFeatureExtractor:
         waveform = self._load_and_preprocess_audio(audio_path)
 
         if waveform.numel() == 0:
-            print(f"Warning: Waveform for {audio_path} is empty. Returning zeros.")
-            return torch.zeros(self.num_frames_to_extract, self.n_mels, device="cpu")
+            print(f"Warning: Waveform for {audio_path} is empty. Returning empty tensor.")
+            return torch.zeros(0, self.n_mels, device="cpu")
 
         mel_spec = self._compute_mel_spectrogram(waveform)
         time_steps = mel_spec.size(-1)
         
         if time_steps == 0:
-            print(f"Warning: Mel spectrogram for {audio_path} has 0 time steps. Returning zeros.")
-            return torch.zeros(self.num_frames_to_extract, self.n_mels, device="cpu")
+            print(f"Warning: Mel spectrogram for {audio_path} has 0 time steps. Returning empty tensor.")
+            return torch.zeros(0, self.n_mels, device="cpu")
 
-        if time_steps < self.num_frames_to_extract:
-            indices = torch.linspace(0, time_steps - 1, self.num_frames_to_extract, device=mel_spec.device).long()
-            indices = torch.clamp(indices, 0, time_steps - 1)
-        else:
-            indices = torch.linspace(0, time_steps - 1, self.num_frames_to_extract, device=mel_spec.device).long()
+        # Process the entire spectrogram in batches
+        all_features = []
+        for batch_start in range(0, time_steps, self.num_frames_to_extract):
+            batch_end = min(batch_start + self.num_frames_to_extract, time_steps)
+            batch_indices = torch.arange(batch_start, batch_end, device=mel_spec.device)
+            
+            # If this is the last batch and we need padding
+            if len(batch_indices) < self.num_frames_to_extract:
+                padding_needed = self.num_frames_to_extract - len(batch_indices)
+                padding_indices = torch.full((padding_needed,), batch_indices[-1], device=mel_spec.device)
+                batch_indices = torch.cat([batch_indices, padding_indices])
 
-        sampled_mel_spec = mel_spec.squeeze(0)[:, indices]
-        sampled_mel_spec = sampled_mel_spec.transpose(0, 1)
-        return sampled_mel_spec.cpu()
+            batch_features = mel_spec.squeeze(0)[:, batch_indices]
+            batch_features = batch_features.transpose(0, 1)  # [batch_size, n_mels]
+            all_features.append(batch_features.cpu())
+
+        if not all_features:
+            print(f"Warning: No features were extracted for {audio_path}. Returning empty tensor.")
+            return torch.zeros(0, self.n_mels, device="cpu")
+
+        # Concatenate all batches
+        final_features = torch.cat(all_features, dim=0)  # [total_frames, n_mels]
+        return final_features
 
 _audio_feature_extractor = AudioFeatureExtractor(
     sample_rate=SAMPLE_RATE, 

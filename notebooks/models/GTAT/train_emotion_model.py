@@ -75,24 +75,36 @@ class EmotionTrainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         
-        # Load training and validation CSV files
-        self.train_data_df = pd.read_csv(self.train_video_ids_csv)
-        self.val_data_df = pd.read_csv(self.val_video_ids_csv)
+        # List CSV files nos diretórios de treino e teste
+        self.train_csv_paths = [
+            os.path.join(self.train_video_ids_csv, f)
+            for f in os.listdir(self.train_video_ids_csv)
+            if f.endswith('.csv')
+        ]
+        self.val_csv_paths = [
+            os.path.join(self.val_video_ids_csv, f)
+            for f in os.listdir(self.val_video_ids_csv)
+            if f.endswith('.csv')
+        ]
         
-        # Extract video ids
-        self.train_video_ids = self.train_data_df['video_id'].tolist()
-        self.val_video_ids = self.val_data_df['video_id'].tolist()
-        
+        # Extract video ids from the filenames (removing the .csv extension)
+        self.train_video_ids = [
+        os.path.splitext(os.path.basename(f))[0] for f in self.train_csv_paths
+        ]
+        self.val_video_ids = [
+        os.path.splitext(os.path.basename(f))[0] for f in self.val_csv_paths
+        ]
+
         # Create the datasets
         self.train_dataset = Affwild2GraphDataset(
             video_ids=self.train_video_ids,
             root_dir=self.root_dir,
-            annotations_df=self.train_data_df
+            annotations=self.train_csv_paths
         )
         self.val_dataset = Affwild2GraphDataset(
             video_ids=self.val_video_ids,
             root_dir=self.root_dir,
-            annotations_df=self.val_data_df
+            annotations=self.val_csv_paths
         )
         
         # Create DataLoaders

@@ -2,6 +2,7 @@ from torch.utils.data import Dataset
 import torch
 import torch.nn.functional as F
 import os
+import pandas as pd
 
 from utils.audio import extract_audio_features_for_video
 from utils.video import extract_visual_features
@@ -15,7 +16,7 @@ from utils.config import (
 )
 
 class Affwild2GraphDataset(Dataset):
-    def __init__(self, video_ids, root_dir: str, annotations_df=None):
+    def __init__(self, video_ids, root_dir: str, annotations=None):
         """
         Dataset para grafos de vídeo do Aff-Wild2 para reconhecimento de emoções.
         
@@ -27,7 +28,7 @@ class Affwild2GraphDataset(Dataset):
         """
         self.video_ids = video_ids
         self.root_dir = root_dir
-        self.annotations_df = annotations_df
+        self.annotations = annotations
 
     def __len__(self):
         return len(self.video_ids)
@@ -57,6 +58,39 @@ class Affwild2GraphDataset(Dataset):
                   f"  Proceeding with zero audio features.")
         # --- End audio source path determination ---
 
+        # Initialize valence and arousal
+        valence_tensor = None
+        arousal_tensor = None
+        csv_path = None
+
+        # Extrair csv_path correspondente ao video_id usando a lista de annotations
+        if self.annotations is not None:
+            for path in self.annotations:
+                if os.path.splitext(os.path.basename(path))[0] == video_id:
+                    csv_path = path
+                    break
+
+        # Ler o CSV e extrair as colunas "valence" e "arousal"
+        if csv_path is not None:
+            try:
+                df = pd.read_csv(csv_path)
+                if not df.empty and 'valence' in df.columns and 'arousal' in df.columns:
+                    # Se houver múltiplas linhas, calcula a média dos valores
+                    valence = df['valence']
+                    arousal = df['arousal']
+                    valence_tensor = torch.tensor(valence, dtype=torch.float)
+                    arousal_tensor = torch.tensor(arousal, dtype=torch.float)
+                elif df.empty:
+                    print(f"Warning: Annotation file {csv_path} for video {video_id} is empty.")
+                else:
+                    print(f"Warning: Columns 'valence' or 'arousal' not found in {csv_path} for video {video_id}.")
+            except Exception as e:
+                print(f"Error reading or processing annotation file {csv_path} for video {video_id}: {e}")
+        else:
+            if self.annotations is not None: # Only warn if annotations were expected
+                 print(f"Warning: No annotation file found for video {video_id}.")
+
+
         visual_features = extract_visual_features(visual_frames_folder, num_frames_to_extract=NUM_FRAMES)
         audio_features = extract_audio_features_for_video(audio_source_path) # Handles non-existent path
         
@@ -83,19 +117,7 @@ class Affwild2GraphDataset(Dataset):
                     audio_features, size=NUM_FRAMES, mode='linear', align_corners=False
                 ).squeeze(0).transpose(0, 1)
         
-        graph_data = build_video_graph(visual_features, audio_features)
+        graph_data = build_video_graph(visual_features, audio_features, valence_tensor, arousal_tensor)
         graph_data.video_id = video_id
-        
-        # Adicionar valores de valência e excitação se disponíveis
-        if self.annotations_df is not None:
-            # Encontrar a linha correspondente ao vídeo atual
-            video_annotations = self.annotations_df[self.annotations_df['video_id'] == video_id]
-            
-            if not video_annotations.empty:
-                valence = video_annotations['valence'].values[0]
-                arousal = video_annotations['arousal'].values[0]
-                
-                graph_data.valence = torch.tensor(valence, dtype=torch.float)
-                graph_data.arousal = torch.tensor(arousal, dtype=torch.float)
         
         return graph_data
