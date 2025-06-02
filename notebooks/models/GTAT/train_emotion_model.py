@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from utils.dataset import Affwild2GraphDataset
-from notebooks.models.GTAT.GTAT import GCATopo
+from models.GTAT.GTAT_model import GCATopo
 from utils.config import (
     NUM_FRAMES, 
     VISUAL_FRAMES_SUBDIR_NAME, 

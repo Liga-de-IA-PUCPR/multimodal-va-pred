@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from utils.dataset import Affwild2GraphDataset
-from notebooks.models.GTAT.GTAT import GCATopo
+from models.GTAT.GTAT_model import GCATopo
 from torch_geometric.loader import DataLoader
 
 class EmotionPredictor:

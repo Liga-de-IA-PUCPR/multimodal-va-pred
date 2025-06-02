@@ -31,14 +31,12 @@ class GTATConv(MessagePassing):
         self.dropout = dropout
         self.add_self_loops = add_self_loops
         self.share_weights = share_weights
-        self.lin_l = Linear(in_channels, heads * out_channels, bias=bias,
-                            weight_initializer='glorot')
+        self.lin_l = Linear(in_channels, heads * out_channels, bias=bias)
         
         if share_weights:
             self.lin_r = self.lin_l
         else:
-            self.lin_r = Linear(in_channels, heads * out_channels, bias=bias,
-                                weight_initializer='glorot')
+            self.lin_r = Linear(in_channels, heads * out_channels, bias=bias)
         
         self.att = Parameter(torch.Tensor(1, heads, out_channels))
         self.att2 = Parameter(torch.Tensor(1, heads, self.topology_channels))
@@ -60,12 +58,14 @@ class GTATConv(MessagePassing):
     def reset_parameters(self):
         self.lin_l.reset_parameters()
         self.lin_r.reset_parameters()
+        glorot(self.lin_l.weight)
+        glorot(self.lin_r.weight)
         glorot(self.att)
         glorot(self.att2)
         zeros(self.bias)
         zeros(self.bias2)
 
-    def forward(self, x: Union[Tensor, PairTensor], edge_index: Adj,
+    def forward(self, x: Union[torch.Tensor, PairTensor], edge_index: Adj,
                 topology: torch.Tensor,
                 size: Size = None, return_attention_weights: bool = None):
         H, C = self.heads, self.out_channels
@@ -235,4 +235,4 @@ class GCATopo(nn.Module):
         valence = self.valence_out(x)
         arousal = self.arousal_out(x)
         
-        return valence, arousal 
+        return valence, arousal

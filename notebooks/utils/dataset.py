@@ -36,10 +36,10 @@ class Affwild2GraphDataset(Dataset):
     def __getitem__(self, idx):
         video_id = str(self.video_ids[idx])
         
-        visual_frames_folder = os.path.join(self.root_dir, VISUAL_FRAMES_SUBDIR_NAME, video_id)
+        visual_frames_folder = os.path.join(self.root_dir, video_id)
         
         # --- Determine audio source path with .mp4 and .avi fallback ---
-        audio_dir = os.path.join(self.root_dir, AUDIO_FILES_SUBDIR_NAME)
+        audio_dir = AUDIO_FILES_SUBDIR_NAME
         mp4_path = os.path.join(audio_dir, f"{video_id}.mp4")
         avi_path = os.path.join(audio_dir, f"{video_id}.avi")
 

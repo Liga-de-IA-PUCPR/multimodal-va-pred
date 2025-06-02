@@ -13,7 +13,7 @@ else:
     print(f"Warning: .env file not found at {DOTENV_PATH}. Using default values for relevant settings.")
 
 # --- Model & Feature Extraction Parameters ---
-NUM_FRAMES = 30  # Fixed number of frames for processing, visual and audio aligned to this.
+NUM_FRAMES = 124  # 124 frames per video, corresponding to 5 seconds at 24 fps
 
 # --- Audio Parameters ---
 DEFAULT_SAMPLE_RATE = 16000
@@ -36,7 +36,7 @@ print(f"Config: SAMPLE_RATE={SAMPLE_RATE}, AUDIO_MEL_FMAX={AUDIO_MEL_FMAX}")
 
 # --- Subdirectory Names for Data ---
 VISUAL_FRAMES_SUBDIR_NAME = "cropped_aligned_new_50_vids"
-AUDIO_FILES_SUBDIR_NAME = "new_vids"
+AUDIO_FILES_SUBDIR_NAME = "/Users/lfbf/Library/CloudStorage/OneDrive-GrupoMarista/AffWild2/Video_files"
 
 # --- Backbone output dimensions (example) ---
 VISUAL_BACKBONE_OUT_DIM = 256
