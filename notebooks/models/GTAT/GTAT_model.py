@@ -216,7 +216,7 @@ class GCATopo(nn.Module):
         x, edge_index = data.x, data.edge_index
         
         # Extract topology features
-        topology = self.topology_extractor(x)
+        topology = self.topology_extractor(x) ## ERRO RuntimeError: mat1 and mat2 shapes cannot be multiplied (5318x386 and 384x16)
         
         # Apply GTAT layers
         for i, gtat_layer in enumerate(self.gtat_layers):

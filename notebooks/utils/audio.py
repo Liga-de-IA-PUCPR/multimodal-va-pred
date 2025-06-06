@@ -1,5 +1,7 @@
 import torchaudio
 import torch
+from pydub import AudioSegment
+import io
 import torch.nn.functional as F
 from torchaudio.transforms import MelSpectrogram, Resample
 from utils.config import SAMPLE_RATE, NUM_FRAMES, AUDIO_MEL_N_MELS, AUDIO_MEL_FMAX
@@ -71,42 +73,59 @@ class AudioFeatureExtractor:
         return mel_spec
     
     def extract_features(self, audio_path: str) -> torch.Tensor:
+        target_num_frames = self.num_frames_to_extract # Should be NUM_FRAMES from your config
+
         waveform = self._load_and_preprocess_audio(audio_path)
 
         if waveform.numel() == 0:
-            print(f"Warning: Waveform for {audio_path} is empty. Returning empty tensor.")
-            return torch.zeros(0, self.n_mels, device="cpu")
+            print(f"Warning: Waveform for {audio_path} is empty. Returning zero tensor of shape [{target_num_frames}, {self.n_mels}].")
+            return torch.zeros(target_num_frames, self.n_mels, device="cpu")
 
-        mel_spec = self._compute_mel_spectrogram(waveform)
-        time_steps = mel_spec.size(-1)
+        mel_spec = self._compute_mel_spectrogram(waveform) # Expected shape: [1, n_mels, time_steps]
         
-        if time_steps == 0:
-            print(f"Warning: Mel spectrogram for {audio_path} has 0 time steps. Returning empty tensor.")
-            return torch.zeros(0, self.n_mels, device="cpu")
+        # Ensure mel_spec is on the correct device for processing
+        mel_spec = mel_spec.to(self._device)
 
-        # Process the entire spectrogram in batches
-        all_features = []
-        for batch_start in range(0, time_steps, self.num_frames_to_extract):
-            batch_end = min(batch_start + self.num_frames_to_extract, time_steps)
-            batch_indices = torch.arange(batch_start, batch_end, device=mel_spec.device)
+        # Squeeze channel dim (if present) and transpose to [time_steps, n_mels]
+        if mel_spec.dim() == 3 and mel_spec.size(0) == 1:
+            # Standard case: [1, n_mels, time_steps] -> [n_mels, time_steps] -> [time_steps, n_mels]
+            mel_spec_processed = mel_spec.squeeze(0).transpose(0, 1)
+        elif mel_spec.dim() == 2:
+            # If _compute_mel_spectrogram somehow returns [n_mels, time_steps]
+            mel_spec_processed = mel_spec.transpose(0, 1)
+        else:
+            print(f"Warning: Unexpected mel_spec shape {mel_spec.shape} for {audio_path}. Returning zero tensor of shape [{target_num_frames}, {self.n_mels}].")
+            return torch.zeros(target_num_frames, self.n_mels, device="cpu")
+
+        current_time_steps = mel_spec_processed.size(0)
+
+        if current_time_steps == 0:
+            print(f"Warning: Mel spectrogram for {audio_path} has 0 time steps after processing. Returning zero tensor of shape [{target_num_frames}, {self.n_mels}].")
+            return torch.zeros(target_num_frames, self.n_mels, device="cpu")
+
+        if current_time_steps == target_num_frames:
+            final_features = mel_spec_processed
+
+        elif current_time_steps > target_num_frames:
+            # If more frames than target, uniformly sample
+            indices = torch.linspace(0, current_time_steps - 1, steps=target_num_frames, device=self._device).long()
+            final_features = mel_spec_processed[indices, :]
+
+        else: # current_time_steps < target_num_frames
             
-            # If this is the last batch and we need padding
-            if len(batch_indices) < self.num_frames_to_extract:
-                padding_needed = self.num_frames_to_extract - len(batch_indices)
-                padding_indices = torch.full((padding_needed,), batch_indices[-1], device=mel_spec.device)
-                batch_indices = torch.cat([batch_indices, padding_indices])
+            # If fewer frames than target, pad
+            padding_needed = target_num_frames - current_time_steps
 
-            batch_features = mel_spec.squeeze(0)[:, batch_indices]
-            batch_features = batch_features.transpose(0, 1)  # [batch_size, n_mels]
-            all_features.append(batch_features.cpu())
+            if mel_spec_processed.numel() > 0 : # Check if there's anything to pad from
+                last_frame = mel_spec_processed[-1:, :] # Get the last available frame
+                padding = last_frame.repeat(padding_needed, 1) # Repeat last frame for padding
 
-        if not all_features:
-            print(f"Warning: No features were extracted for {audio_path}. Returning empty tensor.")
-            return torch.zeros(0, self.n_mels, device="cpu")
+            else: # Should be caught by current_time_steps == 0, but as a safeguard
 
-        # Concatenate all batches
-        final_features = torch.cat(all_features, dim=0)  # [total_frames, n_mels]
-        return final_features
+                padding = torch.zeros(padding_needed, self.n_mels, device=self._device)
+            final_features = torch.cat([mel_spec_processed, padding], dim=0)
+        
+        return final_features.cpu() # Ensure final tensor is on CPU as per original logic
 
 _audio_feature_extractor = AudioFeatureExtractor(
     sample_rate=SAMPLE_RATE, 
@@ -115,5 +134,6 @@ _audio_feature_extractor = AudioFeatureExtractor(
     f_max=AUDIO_MEL_FMAX
 )
 
-def extract_audio_features_for_video(video_audio_path: str) -> torch.Tensor:
+def extract_audio_features_for_video(video_audio_path: str, size_of_features: int) -> torch.Tensor:
+    _audio_feature_extractor.num_frames_to_extract = size_of_features
     return _audio_feature_extractor.extract_features(video_audio_path)

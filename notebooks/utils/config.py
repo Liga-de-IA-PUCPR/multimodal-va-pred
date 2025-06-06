@@ -19,7 +19,6 @@ NUM_FRAMES = 124  # 124 frames per video, corresponding to 5 seconds at 24 fps
 DEFAULT_SAMPLE_RATE = 16000
 SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", str(DEFAULT_SAMPLE_RATE)))
 
-AUDIO_MEL_N_MELS = 128 # Number of mel bands for mel spectrogram features
 
 # For MelSpectrogram's f_max. If None, uses sample_rate / 2.
 # Setting it can help avoid warnings about empty high-frequency mel bins.
@@ -40,4 +39,5 @@ AUDIO_FILES_SUBDIR_NAME = "/Users/lfbf/Library/CloudStorage/OneDrive-GrupoMarist
 
 # --- Backbone output dimensions (example) ---
 VISUAL_BACKBONE_OUT_DIM = 256
-# AUDIO_MEL_N_MELS is defined above
+
+AUDIO_MEL_N_MELS = 128 # Number of mel bands for mel spectrogram features
