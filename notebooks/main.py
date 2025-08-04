@@ -1,108 +1,215 @@
-import argparse
 import os
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
-# Ensure config is imported early, as it handles dotenv loading.
-import utils.config as config 
-from utils.dataset import Affwild2GraphDataset
-# For PyTorch Geometric, DataLoader is imported from torch_geometric.loader
-from torch_geometric.loader import DataLoader as PyGDataLoader 
+import pandas as pd
+import numpy as np
 
-def main():
-    parser = argparse.ArgumentParser(description="Process video data into graph structures.")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--video_ids",
-        type=str,
-        help="Comma-separated list of video IDs, e.g. '461,462,463'"
-    )
-    group.add_argument(
-        "--all",
-        action="store_true",
-        help=f"Use all videos found as subdirectories in root_dir/{config.VISUAL_FRAMES_SUBDIR_NAME}/"
-    )
-    parser.add_argument(
-        "--root_dir",
-        type=str,
-        default="data/raw", # Example: "data/affwild2_processed"
-        help="Path to your root data folder. This folder should contain "
-             f"'{config.VISUAL_FRAMES_SUBDIR_NAME}/' for frame images and "
-             f"'{config.AUDIO_FILES_SUBDIR_NAME}/' for .mp4 audio source files."
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1, 
-        help="Batch size for PyG DataLoader. Note: PyG DataLoader handles batching of Data objects."
-    )
-    args = parser.parse_args()
+import seaborn as sns
+import matplotlib.pyplot as plt
 
-    video_ids_list = []
-    if args.all:
-        visual_data_parent_dir = os.path.join(args.root_dir, config.VISUAL_FRAMES_SUBDIR_NAME)
-        if not os.path.isdir(visual_data_parent_dir):
-            print(f"Error: Visual data directory not found: {visual_data_parent_dir}")
-            print(f"Please ensure --root_dir ('{args.root_dir}') is set correctly and "
-                  f"the subdirectory '{config.VISUAL_FRAMES_SUBDIR_NAME}' exists within it.")
-            return
 
-        try:
-            video_ids_list = sorted([
-                d for d in os.listdir(visual_data_parent_dir)
-                if os.path.isdir(os.path.join(visual_data_parent_dir, d))
-            ])
-            if not video_ids_list:
-                print(f"No video ID subdirectories found in {visual_data_parent_dir}.")
-                return
-        except Exception as e:
-            print(f"Error listing video IDs from {visual_data_parent_dir}: {e}")
-            return
-    else:
-        video_ids_list = [v.strip() for v in args.video_ids.split(",") if v.strip()]
+# Import torch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    if not video_ids_list:
-        print("No video IDs specified or found. Exiting.")
-        return
-        
-    print(f"Found {len(video_ids_list)} videos to process. First few: {video_ids_list[:5]}")
+# import lightning
+import lightning as L
+from lightning.pytorch.loggers import CSVLogger
+import torchmetrics
 
-    dataset = Affwild2GraphDataset(video_ids=video_ids_list, root_dir=args.root_dir)
-    loader = PyGDataLoader(dataset, batch_size=args.batch_size, shuffle=False) 
+# import Pytorch Geometric
+import torch_geometric
+import torch_geometric.nn as geom_nn
+import torch_geometric.data as geom_data
 
-    print(f"\nStarting data loading with batch size {args.batch_size}...")
-    processed_batches = 0
-    for batch_idx, data_batch in enumerate(loader):
-        processed_batches += 1
-        # data_batch is a torch_geometric.data.Batch object if batch_size > 1, 
-        # or a torch_geometric.data.Data object if batch_size == 1.
-        
-        print(f"\n[Batch {batch_idx+1}/{len(loader)}]")
-        print(f"  Batch Type: {type(data_batch)}")
-        
-        # Accessing video_id(s) from the batch
-        if args.batch_size == 1 and hasattr(data_batch, 'video_id'):
-            print(f"  Video ID: {data_batch.video_id}")
-        elif args.batch_size > 1 and hasattr(data_batch, 'video_id'): 
-            # If video_id was a list of strings and collated, it would be accessible.
-            # PyG's default collate will make `data_batch.video_id` a list.
-            print(f"  Video IDs in batch: {data_batch.video_id}")
-        
-        print(f"  Number of graphs in batch: {data_batch.num_graphs if hasattr(data_batch, 'num_graphs') else 1}")
-        print(f"  Node features shape (total for batch): {data_batch.x.shape}")
-        print(f"  Edge index shape (total for batch): {data_batch.edge_index.shape}")
-        if hasattr(data_batch, 'batch'): # batch vector mapping nodes to graphs
-             print(f"  Batch vector shape: {data_batch.batch.shape}")
+# Seed
+L.seed_everything(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
-        # --- Placeholder for your model processing ---
-        # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # data_batch = data_batch.to(device)
-        # output = model(data_batch) 
-        # --- End of placeholder ---
 
-    if processed_batches == 0 and len(video_ids_list) > 0:
-         print("\nNo batches were processed. Check dataset initialization and data paths.")
-    else:
-        print(f"\nFinished processing {processed_batches} batches.")
+gnn_layer_by_name = {
+    "GCN": geom_nn.GCNConv,
+    "GAT": geom_nn.GATConv,
+    "GraphConv": geom_nn.GraphConv,
+}
 
-if __name__ == "__main__":
-    main()
+
+class GNNModel(nn.Module):
+    def __init__(
+        self,
+        c_in,
+        c_hidden,
+        c_out,
+        num_layers=2,
+        layer_name="GCN",
+        dp_rate=0.1,
+        **kwargs,
+    ):
+        """
+        Initializes a GNNModel object.
+
+        Args:
+            c_in (int): The number of input channels.
+            c_hidden (int): The number of hidden channels.
+            c_out (int): The number of output channels.
+            num_layers (int, optional): The number of GNN layers. Defaults to 2.
+            layer_name (str, optional): The name of the GNN layer. Defaults to "GCN".
+            dp_rate (float, optional): The dropout rate. Defaults to 0.1.
+            **kwargs: Additional keyword arguments to be passed to the GNN layer.
+
+        Returns:
+            None
+        """
+        super().__init__()
+        gnn_layer = gnn_layer_by_name[layer_name]
+        layers = []
+
+        in_channels, out_channels = c_in, c_out
+        for l_idx in range(num_layers - 1):
+            layers += [
+                gnn_layer(in_channels, c_hidden, *kwargs),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dp_rate),
+            ]
+            in_channels = c_hidden
+        layers += [gnn_layer(in_channels=in_channels, out_channels=c_out, **kwargs)]
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x, edge_index):
+        """Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            edge_index (torch.Tensor): Edge index tensor.
+
+        Returns:
+            torch.Tensor: Output tensor.
+        """
+        # Se a camada atual é uma camada de passagem de mensagem,
+        # então ela precisa de duas informações para realizar sua operação (x, edge_index)
+
+        # Se a camada atual não é uma camada de passagem de mensagem, por exemplo ReLU. dropout
+        # então ela só precisa da entrada x para realizar sua operação.
+
+        for layer in self.layers:
+            if isinstance(layer, geom_nn.MessagePassing):
+                x = layer(x=x, edge_index=edge_index)
+            else:
+                x = layer(x)
+
+        return x
+
+
+class MLPModel(nn.Module):
+    def __init__(self, c_in, c_hidden, c_out, num_layers, dp_rate=0.1):
+        super().__init__()
+        layers = []
+
+        in_channels, out_channels = c_in, c_hidden
+        for l_idx in range(num_layers - 1):
+            layers += [
+                nn.Linear(in_channels, out_channels),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dp_rate),
+            ]
+
+            in_channels = c_hidden
+        layers += [nn.Linear(in_channels, c_out)]
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class NodeLvelGNN(L.LightningModule):
+    def __init__(self, model_name, **model_kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        if model_name == "MLP":
+            self.model = MLPModel(**model_kwargs)
+        else:
+            self.model = GNNModel(**model_kwargs)
+        self.loss_module = nn.CrossEntropyLoss()
+
+        self.acc_train = torchmetrics.Accuracy(task="multiclass", num_classes=7)
+        self.acc_val = torchmetrics.Accuracy(task="multiclass", num_classes=7)
+        self.acc_test = torchmetrics.Accuracy(task="multiclass", num_classes=7)
+
+    def _shared_step(self, data, mode="train"):
+        x, edge_index = data.x, data.edge_index
+        x = self.model(x, edge_index)
+
+        if mode == "train":
+            mask = data.train_mask
+        elif mode == "val":
+            mask = data.val_mask
+        elif mode == "test":
+            mask = data.test_mask
+        else:
+            assert False, f"Unknown mode: {mode}"
+
+        loss = self.loss_module(x[mask], data.y[mask])
+        acc = getattr(self, f"acc_{mode}")(x[mask], data.y[mask])
+        return loss, acc
+
+    def training_step(self, batch, batch_idx):
+        loss, acc = self._shared_step(batch, mode="train")
+        self.log("train_loss", loss, on_epoch=True, on_step=False)
+        self.log("train_acc", acc, on_epoch=True, on_step=False)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss, acc = self._shared_step(batch, mode="val")
+        self.log("val_loss", loss)
+        self.log("val_acc", acc)
+
+    def test_step(self, batch, batch_idx):
+        _, acc = self._shared_step(batch, mode="test")
+        self.log("test_acc", acc)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(
+            self.parameters(), lr=0.1, momentum=0.9, weight_decay=2e-3
+        )
+        return optimizer
+
+
+## modelCheckpoint
+ModelCheckpoint = L.pytorch.callbacks.ModelCheckpoint(
+    monitor="val_loss", mode="max", save_top_k=3
+)
+## earlystopping
+early_stopping_callback = L.pytorch.callbacks.early_stopping.EarlyStopping(
+    monitor="val_loss", patience=25
+)
+
+# TODO create the  dataset
+
+## csv Logger
+csv_logger = CSVLogger("logs", name="cora_logs")
+node_dataloader = geom_data.DataLoader(cora_dataset, batch_size=1)
+trainer = L.Trainer(
+    callbacks=[ModelCheckpoint, early_stopping_callback],
+    logger=csv_logger,
+    accelerator="auto",
+    max_epochs=200,
+    precision="bf16-mixed",
+)
+
+
+model = NodeLvelGNN(
+    model_name="GCN",
+    c_in=1433,
+    c_hidden=16,
+    c_out=7,
+    num_layers=2,
+    layer_name="GCN",
+    dp_rate=0.1,
+)
+# model.compile() # discomment if you are using unix OS
+model
+
+
+trainer.fit(model, node_dataloader, node_dataloader)
+test_result = trainer.test(model, dataloaders=node_dataloader)
