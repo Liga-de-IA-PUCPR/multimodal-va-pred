@@ -176,11 +176,11 @@ class NodeLvelGNN(L.LightningModule):
 
 
 ## modelCheckpoint
-ModelCheckpoint = L.pytorch.callbacks.ModelCheckpoint(
+ModelCheckpoint = L.pytorch.callbacks.ModelCheckpoint( #type: ignore
     monitor="val_loss", mode="max", save_top_k=3
 )
 ## earlystopping
-early_stopping_callback = L.pytorch.callbacks.early_stopping.EarlyStopping(
+early_stopping_callback = L.pytorch.callbacks.early_stopping.EarlyStopping( #type: ignore
     monitor="val_loss", patience=25
 )
 
