@@ -260,34 +260,29 @@ def plot_loss_and_acc(
     if save_acc is not None:
         plt.savefig(save_acc)
 
-
-# Example usage of VideoSequentialGNN for video data
-def create_mock_video_dataset():
-    """Create a mock video dataset for testing VideoSequentialGNN"""
-    # Mock video data: 3 videos with different lengths
-    video_data_list = []
+def create_mock_video_dataset_with_split():
+    """Create separate train and test video datasets"""
+    train_videos = []
+    test_videos = []
     
-    for video_idx in range(3):
-        num_frames = np.random.randint(100, 300)  # Random number of frames
-        num_features = 2  # 2-dimensional features
+    for video_idx in range(5):  # More videos for better split
+        num_frames = np.random.randint(100, 300)
+        num_features = 2
         
-        # Create mock video features normalized between -1 and 1
-        x = torch.rand(num_frames, num_features) * 2 - 1  # Scale [0,1] to [-1,1]
+        x = torch.rand(num_frames, num_features) * 2 - 1
+        y = torch.randint(0, 2, (num_frames,))
         
-        # Create mock per-frame labels (replace with your actual annotations)
-        y = torch.randint(0, 2, (num_frames,))  # 2 classes: 0, 1
-        
-        # Create temporal edges (each frame connects to next few frames)
+        # Create temporal edges
         edge_list = []
         temporal_window = 5
         for i in range(num_frames):
             for j in range(1, temporal_window + 1):
                 if i + j < num_frames:
-                    edge_list.extend([[i, i + j], [i + j, i]])  # bidirectional
+                    edge_list.extend([[i, i + j], [i + j, i]])
         
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
         
-        # All frames available for training (no internal masks needed)
+        # All frames available within each video
         train_mask = torch.ones(num_frames, dtype=torch.bool)
         val_mask = torch.ones(num_frames, dtype=torch.bool)
         test_mask = torch.ones(num_frames, dtype=torch.bool)
@@ -297,13 +292,17 @@ def create_mock_video_dataset():
             train_mask=train_mask, val_mask=val_mask, test_mask=test_mask
         )
         
-        video_data_list.append(video_graph)
+        # Split videos: first 3 for training, last 2 for testing
+        if video_idx < 3:
+            train_videos.append(video_graph)
+        else:
+            test_videos.append(video_graph)
     
-    return video_data_list
+    return train_videos, test_videos
 
-# Create mock video dataset
-video_dataset = create_mock_video_dataset()
-video_dataloader = geom_data.DataLoader(video_dataset, batch_size=1, shuffle=True)
+train_dataset, test_dataset = create_mock_video_dataset_with_split()
+train_dataloader = geom_data.DataLoader(train_dataset, batch_size=1, shuffle=True)
+test_dataloader = geom_data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
 # Create VideoSequentialGNN model
 video_model = VideoSequentialGNN(
@@ -327,9 +326,8 @@ video_trainer = L.Trainer(
 )
 
 # Train the video model
-video_trainer.fit(video_model, video_dataloader, video_dataloader)
+video_trainer.fit(video_model, train_dataloader)
 
 # Test the video model
-video_test_result = video_trainer.test(video_model, dataloaders=video_dataloader)
+video_test_result = video_trainer.test(video_model, dataloaders=test_dataloader)
 
-# %%
