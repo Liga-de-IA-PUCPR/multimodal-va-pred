@@ -1,110 +1,66 @@
-import os
 import pandas as pd
 import numpy as np
-
-import seaborn as sns
 import matplotlib.pyplot as plt
-
-
-# Import torch
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-# import lightning
+import torch.nn.functional as F  # noqa: F401
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger
 import torchmetrics
-
-# import Pytorch Geometric
-import torch_geometric
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch_geometric.utils import remove_self_loops, add_self_loops
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 import torch_geometric.nn as geom_nn
-import torch_geometric.data as geom_data
-
-# Seed
-L.seed_everything(42)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
+from graph_datamodule import VideoDataModule
+from multiprocessing import set_start_method
 
 gnn_layer_by_name = {
     "GCN": geom_nn.GCNConv,
     "GAT": geom_nn.GATConv,
     "GraphConv": geom_nn.GraphConv,
 }
+
 class GNNModel(nn.Module):
     def __init__(
-        self,
-        c_in,
-        c_hidden,
-        c_out,
+    self,
+    c_in: int = 1,
+    c_hidden: int = 64,
+    c_out: int = 2,
         num_layers=2,
         layer_name="GCN",
         dp_rate=0.1,
         **kwargs
     ):
-        """
-        Initializes a GNNModel object.
-
-        Args:
-            c_in (int): The number of input channels.
-            c_hidden (int): The number of hidden channels.
-            c_out (int): The number of output channels.
-            num_layers (int, optional): The number of GNN layers. Defaults to 2.
-            layer_name (str, optional): The name of the GNN layer. Defaults to "GCN".
-            dp_rate (float, optional): The dropout rate. Defaults to 0.1.
-            **kwargs: Additional keyword arguments to be passed to the GNN layer.
-
-        Returns:
-            None
-        """
         super().__init__()
         gnn_layer = gnn_layer_by_name[layer_name]
-        layers = []
-
-        in_channels, out_channels = c_in, c_out
-        for l_idx in range(num_layers - 1):
-            layers += [
-                gnn_layer(in_channels, c_hidden, *kwargs),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dp_rate),
-            ]
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dp_rate)
+        in_channels = c_in
+        for _ in range(num_layers - 1):
+            self.convs.append(gnn_layer(in_channels, c_hidden, **kwargs))
+            self.norms.append(geom_nn.GraphNorm(c_hidden))
             in_channels = c_hidden
-        layers += [gnn_layer(in_channels=in_channels, out_channels=c_out, **kwargs)]
-        self.layers = nn.ModuleList(layers)
+        self.final_conv = gnn_layer(in_channels, c_out, **kwargs)
 
     def forward(self, x, edge_index):
-        """Forward pass of the model.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            edge_index (torch.Tensor): Edge index tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-        # Se a camada atual é uma camada de passagem de mensagem,
-        # então ela precisa de duas informações para realizar sua operação (x, edge_index)
-
-        # Se a camada atual não é uma camada de passagem de mensagem, por exemplo ReLU. dropout
-        # então ela só precisa da entrada x para realizar sua operação.
-
-        for layer in self.layers:
-            if isinstance(layer, geom_nn.MessagePassing):
-                x = layer(x=x, edge_index=edge_index)
-            else:
-                x = layer(x)
+        for conv, norm in zip(self.convs, self.norms):
+            residual = x
+            x = conv(x, edge_index)
+            x = norm(x)
+            x = self.relu(x)
+            x = self.dropout(x)
+            if residual.shape == x.shape:
+                x = x + residual
+        x = self.final_conv(x, edge_index)
         return x
 
 
-geom_nn.MessagePassing
-
-# %%
 class MLPModel(nn.Module):
-    def __init__(self, c_in, c_hidden, c_out, num_layers, dp_rate=0.1):
+    def __init__(self, c_in: int = 1, c_hidden: int = 64, c_out: int = 2, num_layers: int = 2, dp_rate: float = 0.1):
         super().__init__()
         layers = []
-
         in_channels, out_channels = c_in, c_hidden
         for l_idx in range(num_layers - 1):
             layers += [
@@ -112,222 +68,165 @@ class MLPModel(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout(dp_rate),
             ]
-
             in_channels = c_hidden
         layers += [nn.Linear(in_channels, c_out)]
         self.layers = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, edge_index=None):
         return self.layers(x)
 
-# %%
 class VideoSequentialGNN(L.LightningModule):
     def __init__(self, model_name, num_classes=3, **model_kwargs):
         super().__init__()
         self.save_hyperparameters()
         self.num_classes = num_classes
-
         if model_name == "MLP":
             self.model = MLPModel(**model_kwargs)
         else:
             self.model = GNNModel(**model_kwargs)
-        
-        self.loss_module = nn.CrossEntropyLoss()
-        
-        self.acc_train = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
-        self.acc_val = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
-        self.acc_test = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+        self.loss_module = nn.MSELoss()
+        self.train_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
+        self.val_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
+        self.test_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
+
+    @staticmethod
+    def _ccc(preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        x = preds
+        y = target
+        x_mean, y_mean = x.mean(dim=0), y.mean(dim=0)
+        x_var, y_var = x.var(dim=0, unbiased=False), y.var(dim=0, unbiased=False)
+        cov = ((x - x_mean) * (y - y_mean)).mean(dim=0)
+        ccc = 2 * cov / (x_var + y_var + (x_mean - y_mean).pow(2) + 1e-8)
+        return ccc
 
     def sequential_video_predict(self, data, mode="test"):
         x, edge_index = data.x, data.edge_index
-        num_frames = x.shape[0]
+        if edge_index is None or edge_index.numel() == 0:
+            edge_index = torch.empty(2, 0, dtype=torch.long, device=x.device)
+        edge_index, x = edge_index.to(self.device), x.to(self.device)
+        edge_index, _ = remove_self_loops(edge_index)
+        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        predictions = self.model(x, edge_index)
+        y = data.y.to(self.device)
+        loss = self.loss_module(predictions, y)
+        pearson = getattr(self, f"{mode}_pearson")(predictions, y)
+        ccc = self._ccc(predictions, y)
+        return loss, pearson, ccc, predictions
         
-        # Start with original frame features
-        current_x = x.clone()
-        predictions = []
-        losses = []
-        
-        # For videos, predict frames in temporal order (0, 1, 2, ...)
-        for frame_idx in range(num_frames):
-            # Run GNN with current features
-            frame_outputs = self.model(current_x, edge_index)
-            
-            # Get prediction for current frame
-            frame_pred = frame_outputs[frame_idx]
-            predicted_label = torch.argmax(frame_pred)
-            predictions.append(predicted_label)
-            
-            # Calculate loss for this frame
-            if mode == "train":
-                step_loss = self.loss_module(frame_pred.unsqueeze(0), data.y[frame_idx].unsqueeze(0))
-                losses.append(step_loss)
-            
-            # Update current frame's features with its prediction
-            # This gives the model "memory" of what it predicted before
-            one_hot_pred = torch.zeros(self.num_classes, device=x.device)
-            one_hot_pred[predicted_label] = 1.0
-            
-            # Add prediction information to subsequent frames
-            for future_frame in range(frame_idx + 1, min(frame_idx + 5, num_frames)):  # Affect next 5 frames
-                decay = 0.8 ** (future_frame - frame_idx)  # Decay influence over time
-                if current_x.shape[1] >= self.num_classes:
-                    current_x[future_frame, :self.num_classes] += decay * 0.1 * one_hot_pred
-            
-            if frame_idx % 50 == 0:  # Print every 50 frames
-                print(f"Frame {frame_idx}: Predicted {predicted_label.item()}")
-        
-        predictions = torch.stack(predictions)
-        
-        if mode == "train" and losses:
-            total_loss = torch.stack(losses).mean()
-            acc = self.acc_train(predictions, data.y)
-            return total_loss, acc, predictions
-        else:
-            acc = getattr(self, f"acc_{mode}")(predictions, data.y)
-            return None, acc, predictions
-
     def _shared_step(self, data, mode="train"):
-        if mode == "train":
-            loss, acc, predictions = self.sequential_video_predict(data, mode)
-            return loss, acc
-        else:
-            _, acc, predictions = self.sequential_video_predict(data, mode)
-            return torch.tensor(0.0, device=self.device), acc
+        loss, pearson, ccc, _ = self.sequential_video_predict(data, mode)
+        return loss, pearson, ccc
 
     def training_step(self, batch, batch_idx):
-        loss, acc = self._shared_step(batch, mode="train")
-        self.log("train_loss", loss, on_epoch=True, on_step=False)
-        self.log("train_acc", acc, on_epoch=True, on_step=False)
+        loss, pearson, ccc = self._shared_step(batch, mode="train")
+        bs = getattr(batch, "num_graphs", 1)
+        self.log("train_loss", loss, on_epoch=True, on_step=False, batch_size=bs)
+        self.log("train_pearson", pearson.mean(), on_epoch=True, on_step=False, batch_size=bs)
+        self.log("train_ccc", ccc.mean(), on_epoch=True, on_step=False, batch_size=bs)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, acc = self._shared_step(batch, mode="val")
-        self.log("val_acc", acc)
+        loss, pearson, ccc = self._shared_step(batch, mode="val")
+        bs = getattr(batch, "num_graphs", 1)
+        self.log("val_loss", loss, on_epoch=True, on_step=False, batch_size=bs)
+        self.log("val_pearson", pearson.mean(), on_epoch=True, on_step=False, batch_size=bs)
+        self.log("val_ccc", ccc.mean(), on_epoch=True, on_step=False, batch_size=bs)
 
     def test_step(self, batch, batch_idx):
-        _, acc = self._shared_step(batch, mode="test")
-        self.log("test_acc", acc)
+        loss, pearson, ccc = self._shared_step(batch, mode="test")
+        bs = getattr(batch, "num_graphs", 1)
+        self.log("test_loss", loss, on_epoch=True, on_step=False, batch_size=bs)
+        self.log("test_pearson", pearson.mean(), on_epoch=True, on_step=False, batch_size=bs)
+        self.log("test_ccc", ccc.mean(), on_epoch=True, on_step=False, batch_size=bs)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(), lr=0.001, weight_decay=1e-4
-        )
-        return optimizer
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001, weight_decay=1e-4)
+        scheduler = {
+            "scheduler": ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5),
+            "monitor": "val_loss",
+        }
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
-
-# callbacks
-## modelCheckpoint
-ModelCheckpoint = L.pytorch.callbacks.ModelCheckpoint(monitor="train_loss", mode="min", save_top_k=3)
-## earlystopping
-early_stopping_callback = L.pytorch.callbacks.EarlyStopping(monitor="train_loss", patience=25)
-
-
-## csv Logger
-csv_logger = CSVLogger("logs", name="cora_logs")
-
-# Note: You need to load your actual dataset here
-# For Cora dataset: from torch_geometric.datasets import Planetoid
-# cora_dataset = Planetoid(root='/tmp/Cora', name='Cora')[0]
-
-
-def plot_loss_and_acc(
-    log_dir, loss_ylim=(0.0, 0.9), acc_ylim=(0.7, 1.0), save_loss=None, save_acc=None
-):
-
+def plot_loss_and_acc(log_dir, loss_ylim=(0.0, 0.9), acc_ylim=(0.3, 1.0), save_loss=None, save_acc=None):
     metrics = pd.read_csv(f"{log_dir}/metrics.csv")
-
     aggreg_metrics = []
     agg_col = "epoch"
     for i, dfg in metrics.groupby(agg_col):
         agg = dict(dfg.mean())
         agg[agg_col] = i
         aggreg_metrics.append(agg)
-
     df_metrics = pd.DataFrame(aggreg_metrics)
-    df_metrics[["train_loss", "val_loss"]].plot(
-        grid=True, legend=True, xlabel="Epoch", ylabel="Loss"
-    )
-
+    df_metrics[["train_loss", "val_loss"]].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Loss")
     plt.ylim(loss_ylim)
     if save_loss is not None:
         plt.savefig(save_loss)
-
-    df_metrics[["train_acc","val_acc"]].plot(
-        grid=True, legend=True, xlabel="Epoch", ylabel="ACC"
-    )
-
+    corr_cols = [c for c in ["train_pearson", "val_pearson"] if c in df_metrics.columns]
+    if len(corr_cols) == 2:
+        df_metrics[corr_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Pearson")
+    ccc_cols = [c for c in ["train_ccc", "val_ccc"] if c in df_metrics.columns]
+    if len(ccc_cols) == 2:
+        df_metrics[ccc_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="CCC")
     plt.ylim(acc_ylim)
     if save_acc is not None:
         plt.savefig(save_acc)
 
-def create_mock_video_dataset_with_split():
-    """Create separate train and test video datasets"""
-    train_videos = []
-    test_videos = []
+# Main execution block to prevent CUDA multiprocessing errors
+if __name__ == "__main__":
+    # Set the start method for multiprocessing
+    try:
+        set_start_method('spawn')
+    except RuntimeError:
+        pass
+
+    L.seed_everything(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Callbacks
+    model_checkpoint = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=3)
+    early_stopping_callback = EarlyStopping(monitor="val_loss", mode="min", patience=25)
+
+    # Logger
+    csv_logger = CSVLogger("logs", name="video_gnn_logs")
+
+    # DataModule
+    datamodule = VideoDataModule(
+        video_dir="/home/user/liga-ia/datasets/affwild2/batch1",
+        cropped_img_dir="/home/user/liga-ia/datasets/affwild2/batch1-cropped",
+        annotation_root="/home/user/liga-ia/datasets/affwild2/Annotations/VA_Estimation_Challenge",
+        time_window_sec=5.0,
+        num_workers=4  # Increase this value for better performance if your system supports it
+    )
+    datamodule.setup()
+
+    # Model
+    video_model = VideoSequentialGNN(
+        model_name="GCN", 
+        c_in=768 + 512,  # Wav2Vec (768) + VGGFace (512) features
+        c_hidden=64,
+        c_out=2,
+        num_classes=2,
+        num_layers=3,
+        layer_name="GCN", 
+        dp_rate=0.2
+    )
+
+    # Trainer
+    video_trainer = L.Trainer(
+        callbacks=[model_checkpoint, early_stopping_callback],
+        logger=csv_logger,
+        accelerator="auto",
+        max_epochs=50,
+        precision="16-mixed",
+        gradient_clip_val=1.0,
+    )
+
+    # --- Training, Testing, and Plotting ---
+    video_trainer.fit(video_model, datamodule=datamodule)
     
-    for video_idx in range(5):  # More videos for better split
-        num_frames = np.random.randint(100, 300)
-        num_features = 2
-        
-        x = torch.rand(num_frames, num_features) * 2 - 1
-        y = torch.randint(0, 2, (num_frames,))
-        
-        # Create temporal edges
-        edge_list = []
-        temporal_window = 5
-        for i in range(num_frames):
-            for j in range(1, temporal_window + 1):
-                if i + j < num_frames:
-                    edge_list.extend([[i, i + j], [i + j, i]])
-        
-        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-        
-        # All frames available within each video
-        train_mask = torch.ones(num_frames, dtype=torch.bool)
-        val_mask = torch.ones(num_frames, dtype=torch.bool)
-        test_mask = torch.ones(num_frames, dtype=torch.bool)
-        
-        video_graph = geom_data.Data(
-            x=x, edge_index=edge_index, y=y,
-            train_mask=train_mask, val_mask=val_mask, test_mask=test_mask
-        )
-        
-        # Split videos: first 3 for training, last 2 for testing
-        if video_idx < 3:
-            train_videos.append(video_graph)
-        else:
-            test_videos.append(video_graph)
-    
-    return train_videos, test_videos
+    log_dir = video_trainer.logger.log_dir
+    plot_loss_and_acc(log_dir, save_loss="loss.png", save_acc="corr_ccc.png")
+    plt.show()
 
-train_dataset, test_dataset = create_mock_video_dataset_with_split()
-train_dataloader = geom_data.DataLoader(train_dataset, batch_size=1, shuffle=True)
-test_dataloader = geom_data.DataLoader(test_dataset, batch_size=1, shuffle=False)
-
-# Create VideoSequentialGNN model
-video_model = VideoSequentialGNN(
-    model_name="GCN", 
-    c_in=2,          # 2-dimensional features
-    c_hidden=64,     # Hidden dimension  
-    c_out=2,         # Number of classes
-    num_classes=2,   # Must match c_out
-    num_layers=3,    # Layers for temporal modeling
-    layer_name="GCN", 
-    dp_rate=0.2
-)
-
-# Setup trainer for video model
-video_trainer = L.Trainer(
-    callbacks=[ModelCheckpoint, early_stopping_callback],
-    logger=CSVLogger("logs", name="video_gnn_logs"),
-    accelerator="auto",
-    max_epochs=50,
-    precision="bf16-mixed",
-)
-
-# Train the video model
-video_trainer.fit(video_model, train_dataloader)
-
-# Test the video model
-video_test_result = video_trainer.test(video_model, dataloaders=test_dataloader)
-
+    video_test_result = video_trainer.test(video_model, dataloaders=datamodule.test_dataloader())
+    print(video_test_result)
