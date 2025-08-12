@@ -15,24 +15,7 @@ from PIL import Image
 
 from graph_datamodule import VideoDataModule
 
-def extract_wav2vec_features(audio_segment, sr, processor, model, device):
-    if audio_segment.size == 0:
-        return np.zeros(768, dtype=np.float32)
-    inputs = processor(audio_segment, sampling_rate=sr, return_tensors="pt", padding=True)
-    inputs = {key: val.to(device) for key, val in inputs.items()}
-    with torch.no_grad():
-        outputs = model(**inputs)
-        features = outputs.last_hidden_state.mean(dim=1)
-    return features.squeeze().cpu().numpy()
-
-def extract_vggface_features(img_paths, transform, model, device):
-    imgs = [transform(Image.open(p).convert("RGB")) for p in img_paths if os.path.exists(p)]
-    if not imgs:
-        return np.zeros(512, dtype=np.float32)
-    imgs_tensor = torch.stack(imgs).to(device)
-    with torch.no_grad():
-        feats = model(imgs_tensor)
-    return feats.mean(dim=0).cpu().numpy()
+# Legacy helpers removed in favor of in-module extractors (WavLM + ResNet50)
 
 gnn_layer_by_name = {
     "GCN": geom_nn.GCNConv,
@@ -96,72 +79,108 @@ class MLPModel(nn.Module):
         return self.layers(x)
 
 class VideoGNN(L.LightningModule):
-    def __init__(self, model_name, num_classes=3, **model_kwargs):
+    def __init__(self, model_name, num_classes=3, loss_alpha: float = 0.5, img_pool_num: int = 3, use_pos_enc: bool = True, **model_kwargs):
         super().__init__()
         self.save_hyperparameters()
         self.num_classes = num_classes
-        if model_name == "MLP":
-            self.model = MLPModel(**model_kwargs)
-        else:
-            self.model = GNNModel(**model_kwargs)
+        self.loss_alpha = float(loss_alpha)
+        self.img_pool_num = int(max(1, img_pool_num))
+        self.use_pos_enc = bool(use_pos_enc)
         self.loss_module = nn.MSELoss()
         self.train_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
         self.val_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
         self.test_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
 
-        # --- Feature extractors ---
-        from transformers import Wav2Vec2Model, Wav2Vec2Processor
-        from facenet_pytorch import InceptionResnetV1
-        from torchvision import transforms
-        wav2vec_model_name = "facebook/wav2vec2-base-960h"
-        self.wav2vec_processor = Wav2Vec2Processor.from_pretrained(wav2vec_model_name)
-        self.wav2vec_model = Wav2Vec2Model.from_pretrained(wav2vec_model_name)
-        self.wav2vec_model.eval()
-        self.vggface_model = InceptionResnetV1(pretrained='vggface2')
-        self.vggface_model.eval()
-        self.vggface_transform = transforms.Compose([
-            transforms.Resize((160, 160)),
-            transforms.ToTensor(),
-        ])
+        # --- Feature extractors (Audio=WavLM, Image=ResNet50) ---
+        # Audio: WavLM Base+ with feature extractor (no tokenizer)
+        from transformers import WavLMModel, AutoFeatureExtractor
+        self.wav_fe = AutoFeatureExtractor.from_pretrained("microsoft/wavlm-base-plus")
+        self.wav_model = WavLMModel.from_pretrained("microsoft/wavlm-base-plus")
+        self.wav_model.eval()
+        self.audio_dim = 768  # WavLM Base+ hidden size
+
+        # Image: ResNet50 (ImageNet) as feature extractor (pool -> 2048)
+        from torchvision.models import resnet50, ResNet50_Weights
+        weights = ResNet50_Weights.DEFAULT
+        backbone = resnet50(weights=weights)
+        modules = list(backbone.children())[:-1]  # remove FC, keep avgpool
+        self.vision_model = nn.Sequential(*modules)
+        self.vision_model.eval()
+        self.vision_transform = weights.transforms()  # includes resize+norm to 224
+        self.vision_dim = 2048
+
+        # Positional encoding dims (sin/cos with 2 frequencies)
+        self.pos_enc_dim = 4
+
         # Feature extraction mini-batch size to cap peak memory
         self.feat_chunk_size = 8
+
+        # Auto-wire model input dim and instantiate backbone
+        expected_c_in = self.audio_dim + self.vision_dim + (self.pos_enc_dim if self.use_pos_enc else 0)
+        # Respect explicit c_in if provided, otherwise inject auto c_in
+        model_kwargs = dict(model_kwargs)
+        model_kwargs.setdefault("c_in", expected_c_in)
+        if model_name == "MLP":
+            self.model = MLPModel(**model_kwargs)
+        else:
+            self.model = GNNModel(**model_kwargs)
+
+    def _compute_positional_encoding(self, batch, device):
+        if not self.use_pos_enc:
+            return torch.zeros((batch.x.size(0), 0), device=device, dtype=torch.float32)
+        # Determine graph boundaries
+        n = batch.x.size(0)
+        if hasattr(batch, "ptr") and batch.ptr is not None:
+            ptr = batch.ptr.to(torch.long).tolist()
+        else:
+            ptr = [0, n]
+        enc = torch.zeros((n, self.pos_enc_dim), device=device, dtype=torch.float32)
+        for g in range(len(ptr) - 1):
+            s, e = ptr[g], ptr[g + 1]
+            L = max(1, e - s)
+            if L == 1:
+                pos = torch.zeros(1, device=device)
+            else:
+                pos = torch.linspace(0, 1, steps=L, device=device)
+            # 2 frequencies
+            pe = torch.stack([
+                torch.sin(2 * torch.pi * pos),
+                torch.cos(2 * torch.pi * pos),
+                torch.sin(4 * torch.pi * pos),
+                torch.cos(4 * torch.pi * pos),
+            ], dim=1)
+            enc[s:e] = pe
+        return enc
 
     def extract_features(self, batch, device):
         """Batchified feature extraction on device with autocast; avoids CPU<->GPU thrash.
 
         Expects batch.x to contain equal-length audio windows (num_nodes, T).
-        Uses one representative image (center frame) per window for VGGFace features.
+        Pools multiple evenly spaced frames per window for ResNet50 features.
         """
-        # 1) Audio features (Wav2Vec2) — chunked batch process
+        # 1) Audio features (WavLM) — chunked batch process
         n = batch.x.shape[0]
         audio_list = [batch.x[i].detach().cpu().numpy() for i in range(n)]
-        audio_feats = torch.empty(n, 768, device=device, dtype=torch.float32)
+        audio_feats = torch.empty(n, self.audio_dim, device=device, dtype=torch.float32)
         for s in range(0, n, self.feat_chunk_size):
             e = min(n, s + self.feat_chunk_size)
             sub_list = audio_list[s:e]
-            inputs = self.wav2vec_processor(sub_list, sampling_rate=16000, return_tensors="pt", padding=True)
+            inputs = self.wav_fe(sub_list, sampling_rate=16000, return_tensors="pt", padding=True)
             inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
-                out = self.wav2vec_model(**inputs)
-                hidden = out.last_hidden_state  # (B, T, 768)
-                if "attention_mask" in inputs:
-                    mask = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
-                    denom = mask.sum(dim=1).clamp(min=1.0)
-                    pooled = (hidden * mask).sum(dim=1) / denom
-                else:
-                    pooled = hidden.mean(dim=1)
+                out = self.wav_model(**inputs)
+                hidden = out.last_hidden_state  # (B, T_feat, 768)
+                # Windows are fixed-length, so uniform mean pooling over feature frames is valid
+                pooled = hidden.mean(dim=1)
             audio_feats[s:e] = pooled.float()
 
-        # 2) Image features (VGGFace) — select one center frame path per window robustly
-        def _to_path_str(obj):
-            if isinstance(obj, str):
-                return obj
+        # 2) Image features (ResNet50) — pool K evenly spaced frames per node
+        def _coerce_paths(obj):
             if isinstance(obj, (list, tuple)):
-                # Return first string found (handles nested lists)
-                for el in obj:
-                    if isinstance(el, str):
-                        return el
-            return None
+                return [p for p in obj if isinstance(p, str)]
+            elif isinstance(obj, str):
+                return [obj]
+            return []
 
         img_paths_per_node = None
         if hasattr(batch, "img_paths"):
@@ -172,46 +191,54 @@ class VideoGNN(L.LightningModule):
                 elif len(ip) == 1 and isinstance(ip[0], list) and len(ip[0]) == n:
                     img_paths_per_node = ip[0]
 
-        center_paths = [None] * n
+        # Flatten selected frames for batch processing
+        flat_imgs: list[torch.Tensor] = []
+        flat_nodes: list[int] = []
         if img_paths_per_node is not None:
             for i in range(n):
-                paths = img_paths_per_node[i]
-                if isinstance(paths, (list, tuple)) and len(paths) > 0:
-                    center = paths[len(paths) // 2]
-                    center_paths[i] = _to_path_str(center)
+                paths = _coerce_paths(img_paths_per_node[i]) if img_paths_per_node[i] is not None else []
+                if len(paths) == 0:
+                    continue
+                if len(paths) <= self.img_pool_num:
+                    sel = paths
+                else:
+                    idxs = np.linspace(0, len(paths) - 1, num=self.img_pool_num)
+                    sel = [paths[int(round(j))] for j in idxs]
+                for p in sel:
+                    if isinstance(p, str) and os.path.isfile(p):
+                        try:
+                            img = Image.open(p).convert("RGB")
+                            img_t = self.vision_transform(img)
+                            flat_imgs.append(img_t)
+                            flat_nodes.append(i)
+                        except Exception:
+                            pass
 
-        # Load and batch valid images
-        imgs, valid_idx = [], []
-        for i, p in enumerate(center_paths):
-            p_str = _to_path_str(p)
-            if p_str is not None and os.path.isfile(p_str):
-                try:
-                    img_t = self.vggface_transform(Image.open(p_str).convert("RGB"))
-                    imgs.append(img_t)
-                    valid_idx.append(i)
-                except Exception:
-                    # Skip unreadable/corrupt image
-                    pass
-
-        image_feats = torch.zeros(n, 512, device=device, dtype=torch.float32)
-        if len(imgs) > 0:
-            for s in range(0, len(imgs), self.feat_chunk_size):
-                e = min(len(imgs), s + self.feat_chunk_size)
-                sub_imgs = torch.stack(imgs[s:e]).to(device, non_blocking=True)
+        image_feats = torch.zeros(n, self.vision_dim, device=device, dtype=torch.float32)
+        if len(flat_imgs) > 0:
+            counts = torch.zeros(n, device=device, dtype=torch.float32)
+            for s in range(0, len(flat_imgs), self.feat_chunk_size):
+                e = min(len(flat_imgs), s + self.feat_chunk_size)
+                sub_imgs = torch.stack(flat_imgs[s:e]).to(device, non_blocking=True)
+                node_idx = torch.as_tensor(flat_nodes[s:e], device=device, dtype=torch.long)
                 with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
-                    sub_feats = self.vggface_model(sub_imgs)  # (b,512)
-                idx_tensor = torch.as_tensor(valid_idx[s:e], device=device)
-                image_feats[idx_tensor] = sub_feats.float()
+                    feats = self.vision_model(sub_imgs).flatten(1)  # (b,2048)
+                # Accumulate
+                image_feats.index_add_(0, node_idx, feats.float())
+                counts.index_add_(0, node_idx, torch.ones_like(node_idx, dtype=torch.float32))
+            counts = counts.clamp_min_(1.0).unsqueeze(1)
+            image_feats = image_feats / counts
 
         # 3) Concatenate features on device
-        x = torch.cat([audio_feats.float(), image_feats.float()], dim=1)  # (N, 1280)
+        pos_enc = self._compute_positional_encoding(batch, device)
+        x = torch.cat([audio_feats.float(), image_feats.float(), pos_enc.float()], dim=1)
         batch.x = x
         return batch
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         if getattr(self, "_extractors_device", None) != device:
-            self.wav2vec_model.to(device)  # type: ignore[arg-type]
-            self.vggface_model.to(device)  # type: ignore[arg-type]
+            self.wav_model.to(device)  # type: ignore[arg-type]
+            self.vision_model.to(device)  # type: ignore[arg-type]
             self._extractors_device = device
         batch = self.extract_features(batch, device)
         batch = batch.to(device, non_blocking=True)
@@ -235,9 +262,11 @@ class VideoGNN(L.LightningModule):
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
         predictions = self.model(x, edge_index)
         y = data.y
-        loss = self.loss_module(predictions, y)
+        mse = self.loss_module(predictions, y)
         pearson = getattr(self, f"{mode}_pearson")(predictions, y)
         ccc = self._ccc(predictions, y)
+        ccc_loss = 1.0 - ccc.mean()
+        loss = self.loss_alpha * mse + (1.0 - self.loss_alpha) * ccc_loss
         return loss, pearson, ccc, predictions
         
     def _shared_step(self, data, mode="train"):
@@ -300,19 +329,19 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = False
 
     # Callbacks
-    model_checkpoint = ModelCheckpoint(monitor="train_loss", mode="min", save_top_k=3)
-    early_stopping_callback = EarlyStopping(monitor="train_loss", mode="min", patience=25)
+    model_checkpoint = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=3)
+    early_stopping_callback = EarlyStopping(monitor="val_loss", mode="min", patience=10)
 
     # Logger
     csv_logger = CSVLogger("logs", name="video_gnn_logs")
 
     # DataModule
     datamodule = VideoDataModule(
-        video_dir="/home/user/liga-ia/datasets/affwild2/batch1",
-        cropped_img_dir="/home/user/liga-ia/datasets/affwild2/batch1-cropped",
-        annotation_root="/home/user/liga-ia/datasets/affwild2/Annotations/VA_Estimation_Challenge",
+        video_dir="/home/azureuser/localfiles/datasets/multimodal/new_vids",
+        cropped_img_dir="/home/azureuser/localfiles/datasets/multimodal/cropped_aligned_new_50_vids",
+        annotation_root="/home/azureuser/localfiles/datasets/multimodal/VA_Estimation_Challenge",
         time_window_sec=1.0,
-    num_workers=8
+    num_workers=3
     )
     datamodule.setup()
 
@@ -328,16 +357,18 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[PreFit] Failed to inspect datasets/dataloader: {e}", flush=True)
 
-    # Model
+    # Model (auto-wired c_in: WavLM 768 + ResNet50 2048 + pos 4 = 2820)
     video_model = VideoGNN(
-        model_name="GCN", 
-        c_in=768 + 512,  # Wav2Vec (768) + VGGFace (512) features
+        model_name="GCN",
         c_hidden=64,
         c_out=2,
         num_classes=2,
         num_layers=3,
-        layer_name="GCN", 
-        dp_rate=0.2
+        layer_name="GCN",
+        dp_rate=0.2,
+        loss_alpha=0.5,
+        img_pool_num=3,
+        use_pos_enc=True,
     )
 
     # Trainer
