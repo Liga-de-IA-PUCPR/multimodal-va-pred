@@ -134,6 +134,26 @@ class VideoDataset(Dataset):
         if hasattr(audio, "ndim") and audio.ndim > 1:
             audio = np.mean(audio, axis=1)
 
+        # --- Compute fixed window length in samples and helper to slice with padding ---
+        samples_per_window = int(round(self.time_window_sec * self.audio_sr))
+        total_samples = int(audio.shape[0]) if isinstance(audio, np.ndarray) else len(audio)
+
+        def slice_audio_fixed(start_frame_idx: int) -> np.ndarray:
+            # Use integer-aligned sample index to avoid cumulative float rounding
+            start_sample = int(round(start_frame_idx * self.audio_sr / self.fps))
+            end_sample = start_sample + samples_per_window
+            # Slice and pad if necessary to enforce fixed length
+            if start_sample >= total_samples:
+                seg = np.zeros((samples_per_window,), dtype=np.float32)
+            else:
+                seg = audio[start_sample:min(end_sample, total_samples)].astype(np.float32, copy=False)
+                if seg.shape[0] < samples_per_window:
+                    pad = np.zeros((samples_per_window - seg.shape[0],), dtype=np.float32)
+                    seg = np.concatenate([seg, pad], axis=0)
+                elif seg.shape[0] > samples_per_window:
+                    seg = seg[:samples_per_window]
+            return seg
+
         node_features, labels, edge_list = [], [], []
         img_paths_per_window = []
         # Preload and sort available frame images for this video (if folder exists)
@@ -145,9 +165,8 @@ class VideoDataset(Dataset):
             if end_idx - start_idx < window_size_frames:
                 continue
 
-            audio_start_sec = start_idx / self.fps
-            audio_end_sec = end_idx / self.fps
-            audio_segment = audio[int(audio_start_sec * self.audio_sr): int(audio_end_sec * self.audio_sr)]
+            # Fixed-length audio segment per window
+            audio_segment = slice_audio_fixed(start_idx)
             # Feature extraction is now handled in LightningModule; we pass raw audio segment
             node_features.append(audio_segment)
 
@@ -167,8 +186,9 @@ class VideoDataset(Dataset):
             edge_list.append([i, i + 1])
             edge_list.append([i + 1, i])
 
-        x = torch.tensor(np.array(node_features), dtype=torch.float)
-        y = torch.tensor(np.array(labels), dtype=torch.float)
+        # Stack into consistent tensors now that all windows are equal length
+        x = torch.as_tensor(np.stack(node_features, axis=0), dtype=torch.float32)
+        y = torch.as_tensor(np.array(labels, dtype=np.float32))
         edge_arr = np.array(edge_list, dtype=np.int64)
         edge_index = torch.from_numpy(edge_arr.T).long() if edge_arr.size > 0 else torch.empty((2, 0), dtype=torch.long)
 
@@ -242,10 +262,31 @@ class VideoDataModule(L.LightningDataModule):
             self.test_dataset = self.val_dataset
 
     def train_dataloader(self):
-        return GeoDataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)  # type: ignore[arg-type]
+        return GeoDataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+        )  
 
     def val_dataloader(self):
-        return GeoDataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)  # type: ignore[arg-type]
+        return GeoDataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+        )  
 
     def test_dataloader(self):
-        return GeoDataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)  # type: ignore[arg-type]
+        return GeoDataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+        )

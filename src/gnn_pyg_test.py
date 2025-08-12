@@ -8,13 +8,12 @@ import torch.nn as nn
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger
 import torchmetrics
-from torch_geometric.utils import remove_self_loops, add_self_loops, to_networkx
+from torch_geometric.utils import remove_self_loops, add_self_loops
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 import torch_geometric.nn as geom_nn
 from PIL import Image
 
 from graph_datamodule import VideoDataModule
-import networkx as nx
 
 def extract_wav2vec_features(audio_segment, sr, processor, model, device):
     if audio_segment.size == 0:
@@ -96,7 +95,7 @@ class MLPModel(nn.Module):
     def forward(self, x, edge_index=None):
         return self.layers(x)
 
-class VideoSequentialGNN(L.LightningModule):
+class VideoGNN(L.LightningModule):
     def __init__(self, model_name, num_classes=3, **model_kwargs):
         super().__init__()
         self.save_hyperparameters()
@@ -124,60 +123,98 @@ class VideoSequentialGNN(L.LightningModule):
             transforms.Resize((160, 160)),
             transforms.ToTensor(),
         ])
+        # Feature extraction mini-batch size to cap peak memory
+        self.feat_chunk_size = 8
 
     def extract_features(self, batch, device):
-        audio_feats = []
-        image_feats = []
+        """Batchified feature extraction on device with autocast; avoids CPU<->GPU thrash.
 
-        # Align img paths per node: PyG may collate Python lists as [per_graph_obj]
+        Expects batch.x to contain equal-length audio windows (num_nodes, T).
+        Uses one representative image (center frame) per window for VGGFace features.
+        """
+        # 1) Audio features (Wav2Vec2) — chunked batch process
+        n = batch.x.shape[0]
+        audio_list = [batch.x[i].detach().cpu().numpy() for i in range(n)]
+        audio_feats = torch.empty(n, 768, device=device, dtype=torch.float32)
+        for s in range(0, n, self.feat_chunk_size):
+            e = min(n, s + self.feat_chunk_size)
+            sub_list = audio_list[s:e]
+            inputs = self.wav2vec_processor(sub_list, sampling_rate=16000, return_tensors="pt", padding=True)
+            inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
+                out = self.wav2vec_model(**inputs)
+                hidden = out.last_hidden_state  # (B, T, 768)
+                if "attention_mask" in inputs:
+                    mask = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                    denom = mask.sum(dim=1).clamp(min=1.0)
+                    pooled = (hidden * mask).sum(dim=1) / denom
+                else:
+                    pooled = hidden.mean(dim=1)
+            audio_feats[s:e] = pooled.float()
+
+        # 2) Image features (VGGFace) — select one center frame path per window robustly
+        def _to_path_str(obj):
+            if isinstance(obj, str):
+                return obj
+            if isinstance(obj, (list, tuple)):
+                # Return first string found (handles nested lists)
+                for el in obj:
+                    if isinstance(el, str):
+                        return el
+            return None
+
         img_paths_per_node = None
         if hasattr(batch, "img_paths"):
             ip = batch.img_paths
             if isinstance(ip, list):
-                # Case 1: already node-aligned list[list[str]]
-                if len(ip) == batch.x.shape[0] and all(isinstance(e, list) for e in ip):
+                if len(ip) == n and all(isinstance(e, (list, tuple)) for e in ip):
                     img_paths_per_node = ip
-                # Case 2: batch_size==1 -> [list[list[str]]]
-                elif len(ip) == 1 and isinstance(ip[0], list) and len(ip[0]) == batch.x.shape[0]:
+                elif len(ip) == 1 and isinstance(ip[0], list) and len(ip[0]) == n:
                     img_paths_per_node = ip[0]
 
-        for i in range(batch.x.shape[0]):
-            audio_segment = batch.x[i].cpu().numpy()
-            audio_feat = extract_wav2vec_features(
-                audio_segment,
-                16000,
-                self.wav2vec_processor,
-                self.wav2vec_model,
-                device
-            )
-            audio_feats.append(audio_feat)
+        center_paths = [None] * n
+        if img_paths_per_node is not None:
+            for i in range(n):
+                paths = img_paths_per_node[i]
+                if isinstance(paths, (list, tuple)) and len(paths) > 0:
+                    center = paths[len(paths) // 2]
+                    center_paths[i] = _to_path_str(center)
 
-            if img_paths_per_node is not None:
-                img_paths = img_paths_per_node[i]
-                img_feat = extract_vggface_features(
-                    img_paths,
-                    self.vggface_transform,
-                    self.vggface_model,
-                    device
-                )
-                image_feats.append(img_feat)
-            else:
-                image_feats.append(np.zeros(512, dtype=np.float32))
+        # Load and batch valid images
+        imgs, valid_idx = [], []
+        for i, p in enumerate(center_paths):
+            p_str = _to_path_str(p)
+            if p_str is not None and os.path.isfile(p_str):
+                try:
+                    img_t = self.vggface_transform(Image.open(p_str).convert("RGB"))
+                    imgs.append(img_t)
+                    valid_idx.append(i)
+                except Exception:
+                    # Skip unreadable/corrupt image
+                    pass
 
-        node_features = [np.concatenate([a, i]) for a, i in zip(audio_feats, image_feats)]
-        x = torch.tensor(np.array(node_features), dtype=torch.float, device=device)
+        image_feats = torch.zeros(n, 512, device=device, dtype=torch.float32)
+        if len(imgs) > 0:
+            for s in range(0, len(imgs), self.feat_chunk_size):
+                e = min(len(imgs), s + self.feat_chunk_size)
+                sub_imgs = torch.stack(imgs[s:e]).to(device, non_blocking=True)
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
+                    sub_feats = self.vggface_model(sub_imgs)  # (b,512)
+                idx_tensor = torch.as_tensor(valid_idx[s:e], device=device)
+                image_feats[idx_tensor] = sub_feats.float()
+
+        # 3) Concatenate features on device
+        x = torch.cat([audio_feats.float(), image_feats.float()], dim=1)  # (N, 1280)
         batch.x = x
         return batch
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
-        # Ensure extractor models are on the correct device (do once)
         if getattr(self, "_extractors_device", None) != device:
             self.wav2vec_model.to(device)  # type: ignore[arg-type]
             self.vggface_model.to(device)  # type: ignore[arg-type]
             self._extractors_device = device
-        # Move PyG Data to device and run feature extraction
-        batch = batch.to(device)
         batch = self.extract_features(batch, device)
+        batch = batch.to(device, non_blocking=True)
         return batch
 
     @staticmethod
@@ -257,10 +294,6 @@ def plot_loss_and_acc(log_dir, loss_ylim=(0.0, 0.9), acc_ylim=(0.3, 1.0), save_l
         plt.savefig(save_acc)
 
 if __name__ == "__main__":
-    # try:
-    #     set_start_method('spawn')
-    # except RuntimeError:
-    #     pass
 
     L.seed_everything(42)
     torch.backends.cudnn.deterministic = True
@@ -275,15 +308,14 @@ if __name__ == "__main__":
 
     # DataModule
     datamodule = VideoDataModule(
-        video_dir="/home/azureuser/localfiles/datasets/multimodal/new_vids",
-        cropped_img_dir="/home/azureuser/localfiles/datasets/multimodal/cropped_aligned_new_50_vids",
-        annotation_root="/home/azureuser/localfiles/datasets/multimodal/VA_Estimation_Challenge",
-        time_window_sec=5.0,
-        num_workers=1
+        video_dir="/home/user/liga-ia/datasets/affwild2/batch1",
+        cropped_img_dir="/home/user/liga-ia/datasets/affwild2/batch1-cropped",
+        annotation_root="/home/user/liga-ia/datasets/affwild2/Annotations/VA_Estimation_Challenge",
+        time_window_sec=1.0,
+    num_workers=8
     )
     datamodule.setup()
 
-    # --- Pre-fit sanity checks (printed to stdout) ---
     try:
         print(f"[PreFit] Dataset sizes -> train: {len(datamodule.train_dataset)}, val: {len(datamodule.val_dataset)}, test: {len(datamodule.test_dataset)}", flush=True)
         train_loader = datamodule.train_dataloader()
@@ -297,7 +329,7 @@ if __name__ == "__main__":
         print(f"[PreFit] Failed to inspect datasets/dataloader: {e}", flush=True)
 
     # Model
-    video_model = VideoSequentialGNN(
+    video_model = VideoGNN(
         model_name="GCN", 
         c_in=768 + 512,  # Wav2Vec (768) + VGGFace (512) features
         c_hidden=64,
@@ -313,7 +345,7 @@ if __name__ == "__main__":
         callbacks=[model_checkpoint, early_stopping_callback],
         logger=csv_logger,
         accelerator="auto",
-        max_epochs=10,
+        max_epochs=50,
         precision="16-mixed",
         gradient_clip_val=1.0,
         log_every_n_steps=1,
