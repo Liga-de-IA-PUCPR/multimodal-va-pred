@@ -337,11 +337,11 @@ if __name__ == "__main__":
 
     # DataModule
     datamodule = VideoDataModule(
-        video_dir="/home/azureuser/localfiles/datasets/multimodal/new_vids",
-        cropped_img_dir="/home/azureuser/localfiles/datasets/multimodal/cropped_aligned_new_50_vids",
-        annotation_root="/home/azureuser/localfiles/datasets/multimodal/VA_Estimation_Challenge",
-        time_window_sec=1.0,
-    num_workers=3
+        video_dir="/home/blau/datasets/affwild2/batch1-video",
+        cropped_img_dir="/home/blau/datasets/affwild2/batch1",
+        annotation_root="/home/blau/datasets/affwild2/6th ABAW Annotations/VA_Estimation_Challenge",
+        time_window_sec=5.0,
+        num_workers=4  # Increase this value for better performance if your system supports it
     )
     datamodule.setup()
 
