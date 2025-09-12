@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import lightning as L
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import MLflowLogger
 import torchmetrics
 from torch_geometric.utils import remove_self_loops, add_self_loops
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
@@ -162,19 +162,19 @@ class VideoGNN(L.LightningModule):
         return img_paths_per_node
 
     def extract_features(self, batch, device):
-        """Batchified feature extraction with modular extractors."""
+        """Batchified feature extraction."""
         n = batch.x.shape[0]
         
-        # 1) Audio features using modular extractor
+        #  Audio features 
         audio_feats = self.audio_extractor.extract_features(batch.x, device, self.feat_chunk_size)
 
-        # 2) Image features using modular extractor
+        # Image features 
         img_paths_per_node = self._get_img_paths_per_node(batch)
         image_feats = self.vision_extractor.extract_features(
             img_paths_per_node, device, self.feat_chunk_size
         )
 
-        # 3) Concatenate features
+        # Concatenate features
         pos_enc = self._compute_positional_encoding(batch, device)
         x = torch.cat([audio_feats.float(), image_feats.float(), pos_enc.float()], dim=1)
         batch.x = x
@@ -240,35 +240,113 @@ class VideoGNN(L.LightningModule):
         self.log("test_pearson", pearson.mean(), on_epoch=True, on_step=False, batch_size=bs)
         self.log("test_ccc", ccc.mean(), on_epoch=True, on_step=False, batch_size=bs)
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.001, weight_decay=1e-4)
-        return optimizer
+    def training_epoch_end(self, outputs):
+        """Log gradient norms at the end of each training epoch."""
+        # Calculate total gradient norm
+        total_norm = 0
+        param_count = 0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        total_norm = total_norm ** (1. / 2) if param_count > 0 else 0
+        
+        # Log to MLflow via Lightning's logger
+        if hasattr(self.logger, 'experiment'):
+            self.logger.experiment.log_metric("grad_norm_total", total_norm, step=self.current_epoch)
+            
+            # Optional: Log per-layer gradient norms (first few layers only to avoid too many metrics)
+            layer_count = 0
+            for name, param in self.named_parameters():
+                if param.grad is not None and layer_count < 5:  # Limit to first 5 layers
+                    grad_norm = param.grad.data.norm(2).item()
+                    # Clean up parameter name for logging
+                    clean_name = name.replace('.', '_').replace('model_', '').replace('convs_', 'conv_')
+                    self.logger.experiment.log_metric(f"grad_{clean_name}", grad_norm, step=self.current_epoch)
+                    layer_count += 1
 
-def plot_loss_and_acc(log_dir, loss_ylim=(0.0, 0.9), acc_ylim=(0.3, 1.0), save_loss=None, save_acc=None):
-    metrics = pd.read_csv(f"{log_dir}/metrics.csv")
-    aggreg_metrics = []
-    agg_col = "epoch"
-    for i, dfg in metrics.groupby(agg_col):
-        mean_vals = dfg.mean(numeric_only=True).to_dict()
-        mean_vals[agg_col] = i
-        aggreg_metrics.append(mean_vals)
-    df_metrics = pd.DataFrame(aggreg_metrics)
-    df_metrics[["train_loss", "val_loss"]].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Loss")
-    plt.ylim(loss_ylim)
-    if save_loss is not None:
-        plt.savefig(save_loss)
-    corr_cols = [c for c in ["train_pearson", "val_pearson"] if c in df_metrics.columns]
-    if len(corr_cols) == 2:
-        df_metrics[corr_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Pearson")
-    ccc_cols = [c for c in ["train_ccc", "val_ccc"] if c in df_metrics.columns]
-    if len(ccc_cols) == 2:
-        df_metrics[ccc_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="CCC")
-    plt.ylim(acc_ylim)
-    if save_acc is not None:
-        plt.savefig(save_acc)
+def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracking_uri="file:./mlruns", 
+                                 loss_ylim=(0.0, 0.9), acc_ylim=(0.3, 1.0), save_loss=None, save_acc=None):
+    """Plot metrics from MLflow instead of CSV files."""
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        
+        client = MlflowClient(tracking_uri=tracking_uri)
+        experiment = client.get_experiment_by_name(experiment_name)
+        
+        if experiment is None:
+            print(f"Experiment '{experiment_name}' not found. Skipping plotting.")
+            return
+            
+        # Get the latest run
+        runs = client.search_runs([experiment.experiment_id], order_by=["start_time DESC"], max_results=1)
+        
+        if not runs:
+            print("No runs found. Skipping plotting.")
+            return
+            
+        run_id = runs[0].info.run_id
+        
+        # Get metrics
+        metrics = {}
+        for metric_key in ["train_loss", "val_loss", "train_pearson", "val_pearson", "train_ccc", "val_ccc"]:
+            try:
+                metric_history = client.get_metric_history(run_id, metric_key)
+                metrics[metric_key] = [(m.step, m.value) for m in metric_history]
+            except Exception:
+                continue
+        
+        if not metrics:
+            print("No metrics found. Skipping plotting.")
+            return
+            
+        # Convert to DataFrame-like structure
+        max_steps = max(len(values) for values in metrics.values()) if metrics else 0
+        df_data = {"epoch": list(range(max_steps))}
+        
+        for metric_key, values in metrics.items():
+            df_data[metric_key] = [v[1] if i < len(values) else None for i, v in enumerate(values)]
+        
+        df_metrics = pd.DataFrame(df_data).dropna(subset=["epoch"])
+        
+        # Plot loss
+        if "train_loss" in df_metrics.columns and "val_loss" in df_metrics.columns:
+            df_metrics[["train_loss", "val_loss"]].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Loss")
+            plt.ylim(loss_ylim)
+            if save_loss is not None:
+                plt.savefig(save_loss)
+                plt.close()
+        
+        # Plot correlations
+        corr_cols = [c for c in ["train_pearson", "val_pearson"] if c in df_metrics.columns]
+        if len(corr_cols) >= 1:
+            df_metrics[corr_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Pearson")
+            plt.ylim(acc_ylim)
+            if save_acc is not None:
+                plt.savefig(save_acc)
+                plt.close()
+        
+        # Plot CCC
+        ccc_cols = [c for c in ["train_ccc", "val_ccc"] if c in df_metrics.columns]
+        if len(ccc_cols) >= 1:
+            df_metrics[ccc_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="CCC")
+            plt.ylim(acc_ylim)
+            if save_acc is not None and save_acc != "corr_ccc.png":
+                plt.savefig("ccc.png")
+                plt.close()
+                
+    except ImportError:
+        print("MLflow not installed. Install with: pip install mlflow")
+    except Exception as e:
+        print(f"Error plotting from MLflow: {e}")
 
 if __name__ == "__main__":
 
+    # Note: Install MLflow for experiment tracking
+    # pip install mlflow
+    
     L.seed_everything(42)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -278,7 +356,11 @@ if __name__ == "__main__":
     early_stopping_callback = EarlyStopping(monitor="val_loss", mode="min", patience=10)
 
     # Logger
-    csv_logger = CSVLogger("logs", name="video_gnn_logs")
+    mlflow_logger = MLflowLogger(
+        experiment_name="video_gnn_experiment", 
+        tracking_uri="file:./mlruns",  # Local tracking directory
+        run_name=f"video_gnn_{L.seed_everything(42)}"  # Use seed for reproducibility
+    )
 
     # DataModule
     datamodule = VideoDataModule(
@@ -322,7 +404,7 @@ if __name__ == "__main__":
     # Trainer
     video_trainer = L.Trainer(
         callbacks=[model_checkpoint, early_stopping_callback],
-        logger=csv_logger,
+        logger=mlflow_logger,
         accelerator="auto",
         max_epochs=50,
         precision="16-mixed",
@@ -333,9 +415,18 @@ if __name__ == "__main__":
     # --- Training, Testing, and Plotting ---
     video_trainer.fit(video_model, datamodule=datamodule)
     
-    log_dir = getattr(video_trainer.logger, "log_dir", ".") if video_trainer.logger is not None else "."
-    plot_loss_and_acc(log_dir, save_loss="loss.png", save_acc="corr_ccc.png")
+    # Plot metrics from MLflow
+    plot_loss_and_acc_from_mlflow(
+        experiment_name="video_gnn_experiment",
+        tracking_uri="file:./mlruns",
+        save_loss="loss.png", 
+        save_acc="corr_ccc.png"
+    )
     plt.show()
 
     video_test_result = video_trainer.test(video_model, dataloaders=datamodule.test_dataloader())
     print(video_test_result)
+    
+    # To view MLflow experiments in browser:
+    # Run: mlflow ui --backend-store-uri file:./mlruns
+    # Then open http://localhost:5000 in your browser
