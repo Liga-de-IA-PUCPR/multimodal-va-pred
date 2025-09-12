@@ -14,8 +14,10 @@ import torch_geometric.nn as geom_nn
 from PIL import Image
 
 from graph_datamodule import VideoDataModule
-
-# Legacy helpers removed in favor of in-module extractors (WavLM + ResNet50)
+from utils.extractors import (
+    WavLMExtractor, HuBERTExtractor, Wav2Vec2Extractor, MFCCExtractor,
+    ResNet50FeatureExtractor, I3DExtractor, LSTMFeatureExtractor, ViTFeatureExtractor
+)
 
 gnn_layer_by_name = {
     "GCN": geom_nn.GCNConv,
@@ -79,47 +81,34 @@ class MLPModel(nn.Module):
         return self.layers(x)
 
 class VideoGNN(L.LightningModule):
-    def __init__(self, model_name, num_classes=3, loss_alpha: float = 0.5, img_pool_num: int = 3, use_pos_enc: bool = True, **model_kwargs):
+    def __init__(self, model_name, audio_extractor, vision_extractor, num_classes=3, loss_alpha: float = 0.5, use_pos_enc: bool = True, **model_kwargs):
         super().__init__()
         self.save_hyperparameters()
         self.num_classes = num_classes
         self.loss_alpha = float(loss_alpha)
-        self.img_pool_num = int(max(1, img_pool_num))
         self.use_pos_enc = bool(use_pos_enc)
         self.loss_module = nn.MSELoss()
+        
+        # Metrics
         self.train_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
         self.val_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
         self.test_pearson = torchmetrics.PearsonCorrCoef(num_outputs=2)
 
-        # --- Feature extractors (Audio=WavLM, Image=ResNet50) ---
-        # Audio: WavLM Base+ with feature extractor (no tokenizer)
-        from transformers import WavLMModel, AutoFeatureExtractor
-        self.wav_fe = AutoFeatureExtractor.from_pretrained("microsoft/wavlm-base-plus")
-        self.wav_model = WavLMModel.from_pretrained("microsoft/wavlm-base-plus")
-        self.wav_model.eval()
-        self.audio_dim = 768  # WavLM Base+ hidden size
-
-        # Image: ResNet50 (ImageNet) as feature extractor (pool -> 2048)
-        from torchvision.models import resnet50, ResNet50_Weights
-        weights = ResNet50_Weights.DEFAULT
-        backbone = resnet50(weights=weights)
-        modules = list(backbone.children())[:-1]  # remove FC, keep avgpool
-        self.vision_model = nn.Sequential(*modules)
-        self.vision_model.eval()
-        self.vision_transform = weights.transforms()  # includes resize+norm to 224
-        self.vision_dim = 2048
-
-        # Positional encoding dims (sin/cos with 2 frequencies)
+        # --- Modular feature extractors ---
+        self.audio_extractor = audio_extractor
+        self.vision_extractor = vision_extractor
+        self.audio_dim = audio_extractor.get_feature_dim()
+        self.vision_dim = vision_extractor.get_feature_dim()
+        
+        # Positional encoding
         self.pos_enc_dim = 4
-
-        # Feature extraction mini-batch size to cap peak memory
         self.feat_chunk_size = 8
-
-        # Auto-wire model input dim and instantiate backbone
+        
+        # Auto-wire model input dim
         expected_c_in = self.audio_dim + self.vision_dim + (self.pos_enc_dim if self.use_pos_enc else 0)
-        # Respect explicit c_in if provided, otherwise inject auto c_in
         model_kwargs = dict(model_kwargs)
         model_kwargs.setdefault("c_in", expected_c_in)
+        
         if model_name == "MLP":
             self.model = MLPModel(**model_kwargs)
         else:
@@ -152,29 +141,8 @@ class VideoGNN(L.LightningModule):
             enc[s:e] = pe
         return enc
 
-    def extract_features(self, batch, device):
-        """Batchified feature extraction on device with autocast; avoids CPU<->GPU thrash.
-
-        Expects batch.x to contain equal-length audio windows (num_nodes, T).
-        Pools multiple evenly spaced frames per window for ResNet50 features.
-        """
-        # 1) Audio features (WavLM) — chunked batch process
-        n = batch.x.shape[0]
-        audio_list = [batch.x[i].detach().cpu().numpy() for i in range(n)]
-        audio_feats = torch.empty(n, self.audio_dim, device=device, dtype=torch.float32)
-        for s in range(0, n, self.feat_chunk_size):
-            e = min(n, s + self.feat_chunk_size)
-            sub_list = audio_list[s:e]
-            inputs = self.wav_fe(sub_list, sampling_rate=16000, return_tensors="pt", padding=True)
-            inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
-                out = self.wav_model(**inputs)
-                hidden = out.last_hidden_state  # (B, T_feat, 768)
-                # Windows are fixed-length, so uniform mean pooling over feature frames is valid
-                pooled = hidden.mean(dim=1)
-            audio_feats[s:e] = pooled.float()
-
-        # 2) Image features (ResNet50) — pool K evenly spaced frames per node
+    def _get_img_paths_per_node(self, batch):
+        """Extract image paths from batch."""
         def _coerce_paths(obj):
             if isinstance(obj, (list, tuple)):
                 return [p for p in obj if isinstance(p, str)]
@@ -182,6 +150,7 @@ class VideoGNN(L.LightningModule):
                 return [obj]
             return []
 
+        n = batch.x.shape[0]
         img_paths_per_node = None
         if hasattr(batch, "img_paths"):
             ip = batch.img_paths
@@ -190,46 +159,22 @@ class VideoGNN(L.LightningModule):
                     img_paths_per_node = ip
                 elif len(ip) == 1 and isinstance(ip[0], list) and len(ip[0]) == n:
                     img_paths_per_node = ip[0]
+        return img_paths_per_node
 
-        # Flatten selected frames for batch processing
-        flat_imgs: list[torch.Tensor] = []
-        flat_nodes: list[int] = []
-        if img_paths_per_node is not None:
-            for i in range(n):
-                paths = _coerce_paths(img_paths_per_node[i]) if img_paths_per_node[i] is not None else []
-                if len(paths) == 0:
-                    continue
-                if len(paths) <= self.img_pool_num:
-                    sel = paths
-                else:
-                    idxs = np.linspace(0, len(paths) - 1, num=self.img_pool_num)
-                    sel = [paths[int(round(j))] for j in idxs]
-                for p in sel:
-                    if isinstance(p, str) and os.path.isfile(p):
-                        try:
-                            img = Image.open(p).convert("RGB")
-                            img_t = self.vision_transform(img)
-                            flat_imgs.append(img_t)
-                            flat_nodes.append(i)
-                        except Exception:
-                            pass
+    def extract_features(self, batch, device):
+        """Batchified feature extraction with modular extractors."""
+        n = batch.x.shape[0]
+        
+        # 1) Audio features using modular extractor
+        audio_feats = self.audio_extractor.extract_features(batch.x, device, self.feat_chunk_size)
 
-        image_feats = torch.zeros(n, self.vision_dim, device=device, dtype=torch.float32)
-        if len(flat_imgs) > 0:
-            counts = torch.zeros(n, device=device, dtype=torch.float32)
-            for s in range(0, len(flat_imgs), self.feat_chunk_size):
-                e = min(len(flat_imgs), s + self.feat_chunk_size)
-                sub_imgs = torch.stack(flat_imgs[s:e]).to(device, non_blocking=True)
-                node_idx = torch.as_tensor(flat_nodes[s:e], device=device, dtype=torch.long)
-                with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.float16):
-                    feats = self.vision_model(sub_imgs).flatten(1)  # (b,2048)
-                # Accumulate
-                image_feats.index_add_(0, node_idx, feats.float())
-                counts.index_add_(0, node_idx, torch.ones_like(node_idx, dtype=torch.float32))
-            counts = counts.clamp_min_(1.0).unsqueeze(1)
-            image_feats = image_feats / counts
+        # 2) Image features using modular extractor
+        img_paths_per_node = self._get_img_paths_per_node(batch)
+        image_feats = self.vision_extractor.extract_features(
+            img_paths_per_node, device, self.feat_chunk_size
+        )
 
-        # 3) Concatenate features on device
+        # 3) Concatenate features
         pos_enc = self._compute_positional_encoding(batch, device)
         x = torch.cat([audio_feats.float(), image_feats.float(), pos_enc.float()], dim=1)
         batch.x = x
@@ -237,8 +182,8 @@ class VideoGNN(L.LightningModule):
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         if getattr(self, "_extractors_device", None) != device:
-            self.wav_model.to(device)  # type: ignore[arg-type]
-            self.vision_model.to(device)  # type: ignore[arg-type]
+            self.audio_extractor.to_device(device)
+            self.vision_extractor.to_device(device)
             self._extractors_device = device
         batch = self.extract_features(batch, device)
         batch = batch.to(device, non_blocking=True)
@@ -357,9 +302,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[PreFit] Failed to inspect datasets/dataloader: {e}", flush=True)
 
-    # Model (auto-wired c_in: WavLM 768 + ResNet50 2048 + pos 4 = 2820)
+    # Model with modular extractors (auto-wired c_in: WavLM 768 + ResNet50 2048 + pos 4 = 2820)
+    audio_extractor = WavLMExtractor()
+    vision_extractor = ResNet50FeatureExtractor()
     video_model = VideoGNN(
         model_name="GCN",
+        audio_extractor=audio_extractor,
+        vision_extractor=vision_extractor,
         c_hidden=64,
         c_out=2,
         num_classes=2,
@@ -367,7 +316,6 @@ if __name__ == "__main__":
         layer_name="GCN",
         dp_rate=0.2,
         loss_alpha=0.5,
-        img_pool_num=3,
         use_pos_enc=True,
     )
 
