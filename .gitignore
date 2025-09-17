@@ -1,5 +1,6 @@
 data/raw/**     
 src/logs/**
+src/mlruns/** 
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

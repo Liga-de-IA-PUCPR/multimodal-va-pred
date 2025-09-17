@@ -6,13 +6,12 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import lightning as L
-from lightning.pytorch.loggers import MLflowLogger
+from lightning.pytorch.loggers import MLFlowLogger
 import torchmetrics
 from torch_geometric.utils import remove_self_loops, add_self_loops
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 import torch_geometric.nn as geom_nn
 from PIL import Image
-
 from graph_datamodule import VideoDataModule
 from utils.extractors import (
     WavLMExtractor, HuBERTExtractor, Wav2Vec2Extractor, MFCCExtractor,
@@ -81,9 +80,25 @@ class MLPModel(nn.Module):
         return self.layers(x)
 
 class VideoGNN(L.LightningModule):
-    def __init__(self, model_name, audio_extractor, vision_extractor, num_classes=3, loss_alpha: float = 0.5, use_pos_enc: bool = True, **model_kwargs):
+    def __init__(self, model_name, audio_extractor_obj, vision_extractor_obj, num_classes=3, loss_alpha: float = 0.5, use_pos_enc: bool = True, **model_kwargs):
         super().__init__()
-        self.save_hyperparameters()
+        
+        # Store extractors (don't log them as they change each run)
+        self.audio_extractor = audio_extractor_obj
+        self.vision_extractor = vision_extractor_obj
+        
+        # Log hyperparameters excluding the extractor objects
+        hyperparams = {
+            'model_name': model_name,
+            'num_classes': num_classes,
+            'loss_alpha': loss_alpha,
+            'use_pos_enc': use_pos_enc,
+            'audio_extractor_type': type(audio_extractor_obj).__name__,
+            'vision_extractor_type': type(vision_extractor_obj).__name__,
+            **model_kwargs
+        }
+        self.save_hyperparameters(hyperparams)
+        
         self.num_classes = num_classes
         self.loss_alpha = float(loss_alpha)
         self.use_pos_enc = bool(use_pos_enc)
@@ -143,36 +158,30 @@ class VideoGNN(L.LightningModule):
 
     def _get_img_paths_per_node(self, batch):
         """Extract image paths from batch."""
-        def _coerce_paths(obj):
-            if isinstance(obj, (list, tuple)):
-                return [p for p in obj if isinstance(p, str)]
-            elif isinstance(obj, str):
-                return [obj]
-            return []
-
-        n = batch.x.shape[0]
-        img_paths_per_node = None
         if hasattr(batch, "img_paths"):
             ip = batch.img_paths
+            n = batch.x.shape[0]
             if isinstance(ip, list):
                 if len(ip) == n and all(isinstance(e, (list, tuple)) for e in ip):
-                    img_paths_per_node = ip
+                    return ip
                 elif len(ip) == 1 and isinstance(ip[0], list) and len(ip[0]) == n:
-                    img_paths_per_node = ip[0]
-        return img_paths_per_node
+                    return ip[0]
+        return None
 
     def extract_features(self, batch, device):
         """Batchified feature extraction."""
-        n = batch.x.shape[0]
-        
-        #  Audio features 
+        # Audio features 
         audio_feats = self.audio_extractor.extract_features(batch.x, device, self.feat_chunk_size)
 
         # Image features 
         img_paths_per_node = self._get_img_paths_per_node(batch)
-        image_feats = self.vision_extractor.extract_features(
-            img_paths_per_node, device, self.feat_chunk_size
-        )
+        if img_paths_per_node is None:
+            # No image paths available, return zeros
+            image_feats = torch.zeros(batch.x.size(0), self.vision_dim, device=device, dtype=torch.float32)
+        else:
+            image_feats = self.vision_extractor.extract_features(
+                img_paths_per_node, device, self.feat_chunk_size
+            )
 
         # Concatenate features
         pos_enc = self._compute_positional_encoding(batch, device)
@@ -240,7 +249,11 @@ class VideoGNN(L.LightningModule):
         self.log("test_pearson", pearson.mean(), on_epoch=True, on_step=False, batch_size=bs)
         self.log("test_ccc", ccc.mean(), on_epoch=True, on_step=False, batch_size=bs)
 
-    def training_epoch_end(self, outputs):
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        return optimizer
+
+    def on_train_epoch_end(self):
         """Log gradient norms at the end of each training epoch."""
         # Calculate total gradient norm
         total_norm = 0
@@ -254,7 +267,8 @@ class VideoGNN(L.LightningModule):
         
         # Log to MLflow via Lightning's logger
         if hasattr(self.logger, 'experiment'):
-            self.logger.experiment.log_metric("grad_norm_total", total_norm, step=self.current_epoch)
+            # Use Lightning's logging system instead of direct MLflow calls
+            self.log("grad_norm_total", total_norm, logger=True)
             
             # Optional: Log per-layer gradient norms (first few layers only to avoid too many metrics)
             layer_count = 0
@@ -263,7 +277,7 @@ class VideoGNN(L.LightningModule):
                     grad_norm = param.grad.data.norm(2).item()
                     # Clean up parameter name for logging
                     clean_name = name.replace('.', '_').replace('model_', '').replace('convs_', 'conv_')
-                    self.logger.experiment.log_metric(f"grad_{clean_name}", grad_norm, step=self.current_epoch)
+                    self.log(f"grad_{clean_name}", grad_norm, logger=True)
                     layer_count += 1
 
 def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracking_uri="file:./mlruns", 
@@ -280,7 +294,6 @@ def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracki
             print(f"Experiment '{experiment_name}' not found. Skipping plotting.")
             return
             
-        # Get the latest run
         runs = client.search_runs([experiment.experiment_id], order_by=["start_time DESC"], max_results=1)
         
         if not runs:
@@ -289,7 +302,6 @@ def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracki
             
         run_id = runs[0].info.run_id
         
-        # Get metrics
         metrics = {}
         for metric_key in ["train_loss", "val_loss", "train_pearson", "val_pearson", "train_ccc", "val_ccc"]:
             try:
@@ -311,7 +323,7 @@ def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracki
         
         df_metrics = pd.DataFrame(df_data).dropna(subset=["epoch"])
         
-        # Plot loss
+        
         if "train_loss" in df_metrics.columns and "val_loss" in df_metrics.columns:
             df_metrics[["train_loss", "val_loss"]].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Loss")
             plt.ylim(loss_ylim)
@@ -319,7 +331,7 @@ def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracki
                 plt.savefig(save_loss)
                 plt.close()
         
-        # Plot correlations
+        
         corr_cols = [c for c in ["train_pearson", "val_pearson"] if c in df_metrics.columns]
         if len(corr_cols) >= 1:
             df_metrics[corr_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="Pearson")
@@ -328,7 +340,7 @@ def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracki
                 plt.savefig(save_acc)
                 plt.close()
         
-        # Plot CCC
+        
         ccc_cols = [c for c in ["train_ccc", "val_ccc"] if c in df_metrics.columns]
         if len(ccc_cols) >= 1:
             df_metrics[ccc_cols].plot(grid=True, legend=True, xlabel="Epoch", ylabel="CCC")
@@ -343,9 +355,6 @@ def plot_loss_and_acc_from_mlflow(experiment_name="video_gnn_experiment", tracki
         print(f"Error plotting from MLflow: {e}")
 
 if __name__ == "__main__":
-
-    # Note: Install MLflow for experiment tracking
-    # pip install mlflow
     
     L.seed_everything(42)
     torch.backends.cudnn.deterministic = True
@@ -356,7 +365,7 @@ if __name__ == "__main__":
     early_stopping_callback = EarlyStopping(monitor="val_loss", mode="min", patience=10)
 
     # Logger
-    mlflow_logger = MLflowLogger(
+    mlflow_logger = MLFlowLogger(
         experiment_name="video_gnn_experiment", 
         tracking_uri="file:./mlruns",  # Local tracking directory
         run_name=f"video_gnn_{L.seed_everything(42)}"  # Use seed for reproducibility
@@ -364,11 +373,12 @@ if __name__ == "__main__":
 
     # DataModule
     datamodule = VideoDataModule(
-        video_dir="/home/azureuser/localfiles/datasets/multimodal/new_vids",
-        cropped_img_dir="/home/azureuser/localfiles/datasets/multimodal/cropped_aligned_new_50_vids",
-        annotation_root="/home/azureuser/localfiles/datasets/multimodal/VA_Estimation_Challenge",
+        video_dir="/home/blau/datasets/affwild2/batch1-video",
+        cropped_img_dir="/home/blau/datasets/affwild2/batch1",
+        annotation_root="/home/blau/datasets/affwild2/6th ABAW Annotations/VA_Estimation_Challenge",
         time_window_sec=1.0,
-    num_workers=3
+        batch_size=1,  
+        num_workers=0  
     )
     datamodule.setup()
 
@@ -389,14 +399,14 @@ if __name__ == "__main__":
     vision_extractor = ResNet50FeatureExtractor()
     video_model = VideoGNN(
         model_name="GCN",
-        audio_extractor=audio_extractor,
-        vision_extractor=vision_extractor,
-        c_hidden=64,
+        audio_extractor_obj=audio_extractor,
+        vision_extractor_obj=vision_extractor,
+        c_hidden=32,  
         c_out=2,
         num_classes=2,
-        num_layers=3,
+        num_layers=2,  
         layer_name="GCN",
-        dp_rate=0.2,
+        dp_rate=0.3, 
         loss_alpha=0.5,
         use_pos_enc=True,
     )
@@ -406,10 +416,13 @@ if __name__ == "__main__":
         callbacks=[model_checkpoint, early_stopping_callback],
         logger=mlflow_logger,
         accelerator="auto",
-        max_epochs=50,
-        precision="16-mixed",
+        max_epochs=25,  
+        precision="32",  
         gradient_clip_val=1.0,
         log_every_n_steps=1,
+        enable_progress_bar=True,
+        devices=1,
+        accumulate_grad_batches=2,  
     )
 
     # --- Training, Testing, and Plotting ---

@@ -92,11 +92,14 @@ class VideoDataset(Dataset):
         num_frames = len(ann_df)
 
         # --- Audio decode and cache ---
-        # Only decode once per video per epoch (in-memory cache)
+        # Use per-worker cache to avoid multiprocessing issues
+        worker_id = torch.utils.data.get_worker_info().id if torch.utils.data.get_worker_info() else 0
+        cache_key = f"{worker_id}_{video_name}"
+        
         if not hasattr(self, "_audio_cache"):
             self._audio_cache = {}
-        if video_name in self._audio_cache:
-            audio = self._audio_cache[video_name]
+        if cache_key in self._audio_cache:
+            audio = self._audio_cache[cache_key]
         else:
             try:
                 reader = StreamReader(video_path)
@@ -129,7 +132,7 @@ class VideoDataset(Dataset):
                 logger.debug(f"torchaudio failed to load audio for {video_name}: {e}. Using silence.")
                 duration_sec = num_frames / float(self.fps)
                 audio = np.zeros(max(1, int(duration_sec * self.audio_sr)), dtype=np.float32)
-            self._audio_cache[video_name] = audio
+            self._audio_cache[cache_key] = audio
 
         if hasattr(audio, "ndim") and audio.ndim > 1:
             audio = np.mean(audio, axis=1)
@@ -269,6 +272,7 @@ class VideoDataModule(L.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
+            worker_init_fn=self._worker_init_fn if self.num_workers > 0 else None,
         )  
 
     def val_dataloader(self):
@@ -279,6 +283,7 @@ class VideoDataModule(L.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
+            worker_init_fn=self._worker_init_fn if self.num_workers > 0 else None,
         )  
 
     def test_dataloader(self):
@@ -289,4 +294,15 @@ class VideoDataModule(L.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
+            worker_init_fn=self._worker_init_fn if self.num_workers > 0 else None,
         )
+
+    @staticmethod
+    def _worker_init_fn(worker_id):
+        """Initialize worker process to avoid CUDA context issues."""
+        import torch
+        # Set unique seed for each worker
+        torch.manual_seed(42 + worker_id)
+        if torch.cuda.is_available():
+            # Disable CUDA in worker processes to avoid context issues
+            torch.cuda.set_device(-1)

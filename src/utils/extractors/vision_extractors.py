@@ -10,7 +10,7 @@ from .base_extractors import VisionFeatureExtractor
 class ResNet50FeatureExtractor(VisionFeatureExtractor):
     """ResNet50-based vision feature extractor."""
 
-    def __init__(self):
+    def __init__(self, img_pool_num: int = 8):
         from torchvision.models import resnet50, ResNet50_Weights
         weights = ResNet50_Weights.DEFAULT
         backbone = resnet50(weights=weights)
@@ -19,6 +19,7 @@ class ResNet50FeatureExtractor(VisionFeatureExtractor):
         self.model.eval()
         self.transforms = weights.transforms()
         self.feature_dim = 2048
+        self.img_pool_num = img_pool_num
 
     def get_feature_dim(self) -> int:
         return self.feature_dim
@@ -246,12 +247,13 @@ class LSTMFeatureExtractor(VisionFeatureExtractor):
 class ViTFeatureExtractor(VisionFeatureExtractor):
     """Vision Transformer-based feature extractor."""
 
-    def __init__(self, model_name: str = "google/vit-base-patch16-224"):
+    def __init__(self, model_name: str = "google/vit-base-patch16-224", img_pool_num: int = 8):
         from transformers import ViTModel, ViTFeatureExtractor
         self.feature_extractor = ViTFeatureExtractor.from_pretrained(model_name)
         self.model = ViTModel.from_pretrained(model_name)
         self.model.eval()
         self.feature_dim = self.model.config.hidden_size  # 768 for base
+        self.img_pool_num = img_pool_num
 
     def get_feature_dim(self) -> int:
         return self.feature_dim
